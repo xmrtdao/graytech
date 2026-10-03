@@ -1,0 +1,9 @@
+﻿# Ignore the local environments and the downloaded model pack. Both are large,
+# reproducible from pyproject.toml, and the model in particular is a few hundred
+# MB that does not belong in git.
+face-service/.venv/
+face-service/.venv-dml/
+face-service/models/
+face-service/identities/
+__pycache__/
+*.pyc
