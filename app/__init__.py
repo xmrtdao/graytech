@@ -36,6 +36,8 @@ import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from app.calibration import calibrator
+
 log = logging.getLogger("face-service")
 
 # ── Configuration ───────────────────────────────────────────────────────────
@@ -49,6 +51,15 @@ DET_SIZE = int(os.environ.get("FACE_DET_SIZE", "320"))
 # CPU and is slower than either one alone.
 ORT_INTRA_OP_THREADS = int(os.environ.get("FACE_ORT_THREADS", "1"))
 MATCH_THRESHOLD = float(os.environ.get("FACE_MATCH_THRESHOLD", "0.45"))
+
+# The calibrator owns the live threshold. MATCH_THRESHOLD is only the seed value
+# it starts from, so a change here is a starting point rather than a hardcode that
+# can never be revised by evidence.
+calibrator.threshold = MATCH_THRESHOLD
+
+
+def current_threshold() -> float:
+    return calibrator.threshold
 MAX_UPLOAD_BYTES = int(os.environ.get("FACE_MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
 
 MODEL_ROOT = Path(os.environ.get("FACE_MODEL_ROOT", "./models")).resolve()
@@ -105,7 +116,11 @@ class _Face:
                 if vec.shape[0] != 512:
                     log.warning("skipping %s: expected 512 dims, got %d", path.name, vec.shape[0])
                     continue
-                vecs.append(_l2(vec))
+                # Blend in anything adaptive matching has learned for this profile,
+                # so the running mean of corrections is what gets compared against.
+                base = _l2(vec)
+                vec = calibrator.profile_vector(path.stem, base)
+                vecs.append(vec)
                 names.append(path.stem)
         with self.lock:
             self.names = names
@@ -157,6 +172,7 @@ class _Face:
         # Both sides are already L2-normalised, so the dot product IS cosine
         # similarity. One (n_faces x 512) @ (512 x n_ids) matmul.
         sims = matrix @ index.T
+        threshold = calibrator.threshold
         out = []
         for row in sims:
             kk = min(k, len(names))
@@ -166,11 +182,41 @@ class _Face:
                 {
                     "name": names[int(i)],
                     "cosine": round(float(row[int(i)]), 4),
-                    "matched": bool(float(row[int(i)]) >= MATCH_THRESHOLD),
+                    "matched": bool(float(row[int(i)]) >= threshold),
                 }
                 for i in top
             ])
         return out
+
+    def match_recorded(self, matrix: np.ndarray, truth: Optional[str] = None,
+                       k: int = 1) -> list[list[dict]]:
+        """
+        Match and feed the calibrator.
+
+        `truth` is the name we believe is correct, when known. That is what turns
+        a raw score into a labelled observation: correct/incorrect, and
+        genuine-gallery-member/not. Without it we can only record a score, which
+        is not enough to locate the error boundary.
+
+        A truth that is not in the gallery is recorded as known=False - a
+        stranger - which is the observation the false-accept geometry is built
+        from.
+        """
+        results = self.match(matrix, k=k)
+        for row in results:
+            if not row:
+                continue
+            top = row[0]
+            with self.lock:
+                in_gallery = top["name"] in self.names
+            if truth is None:
+                continue
+            calibrator.record(
+                score=top["cosine"],
+                correct=(top["name"] == truth),
+                known=bool(in_gallery and truth in self.names),
+            )
+        return results
 
 
 def _l2(v: np.ndarray) -> np.ndarray:
@@ -221,6 +267,10 @@ class RegisterRequest(BaseModel):
     embedding: list[float]
 
 
+class ThresholdRequest(BaseModel):
+    threshold: float
+
+
 @app.get("/health")
 def health() -> dict:
     return {
@@ -229,10 +279,59 @@ def health() -> dict:
         "det_size": DET_SIZE,
         "model_load_ms": round(face.load_ms, 1),
         "identities": len(face.names),
-        "match_threshold": MATCH_THRESHOLD,
+        "match_threshold": round(calibrator.threshold, 4),
+        "threshold_seed": MATCH_THRESHOLD,
+        "observations": len(calibrator.samples),
         "ort_intra_op_threads": ORT_INTRA_OP_THREADS,
         "provider": "CPUExecutionProvider",
     }
+
+
+# ── Calibration and adaptive matching ──────────────────────────────────────
+# Endpoints for the two things that can improve without touching the frozen
+# network: the operating point, and the per-profile reference vectors.
+
+
+@app.get("/calibration")
+def calibration_status() -> dict:
+    return calibrator.snapshot()
+
+
+@app.get("/calibration/recommend")
+def calibration_recommend() -> dict:
+    return calibrator.recommend()
+
+
+@app.post("/calibration/threshold")
+def set_threshold(req: ThresholdRequest) -> dict:
+    return calibrator.apply(req.threshold)
+
+
+class LearnRequest(BaseModel):
+    name: str
+    embedding: list[float]
+    source: str = "correction"
+
+
+@app.post("/calibration/learn")
+def learn(req: LearnRequest) -> dict:
+    """
+    Add one accepted sample to an EXISTING profile.
+
+    This cannot create an identity - `name` must already be enrolled. There is
+    deliberately no endpoint here that enrols an unrecognised face; adapting
+    enrolled people's profiles is the whole of the capability.
+    """
+    if req.name not in face.names:
+        raise HTTPException(
+            400, f"{req.name} is not in the gallery - this endpoint enriches "
+                 f"existing profiles and cannot enrol new identities")
+    vec = np.asarray(req.embedding, dtype=np.float32).reshape(-1)
+    result = calibrator.learn_identity(req.name, vec, source=req.source)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "learn failed"))
+    face.reload_identities()      # rebuild so the blended vector takes effect
+    return result
 
 
 async def _read_limited(upload: UploadFile) -> bytes:

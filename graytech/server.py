@@ -305,7 +305,13 @@ class Scene:
             self.log("scan", name=v.name, detected=False, matched=False)
             return
 
-        m = recogniser.match(matrix, k=1)
+        # RECORD every outcome for calibration. match_recorded takes the name we
+        # believe is correct, which is what turns a raw score into a labelled
+        # observation. Without it the panel has nothing to show and the
+        # threshold can never be revised by evidence - which is exactly the
+        # hardcoded-0.45 problem this is meant to fix.
+        truth = safe_identity(v.name)
+        m = recogniser.match_recorded(matrix, truth=truth, k=1)
         top = m[0][0] if (m and m[0]) else None
         v.scanned = True
         if top and top["matched"]:
@@ -401,6 +407,19 @@ def faceapp_synth_name(stem: str) -> str:
     return re.sub(r"_\d+$", "", stem).strip()
 
 
+def safe_identity(name: str) -> str:
+    """
+    'Akshay Kumar' -> 'Akshay_Kumar', matching how identities are stored on disk.
+
+    The scene knows people by their readable dataset name, the gallery knows them
+    by the filesystem-safe key. Scoring those against each other naively would
+    mark every correct match as incorrect and poison the calibration data with
+    false negatives that never happened.
+    """
+    import re
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+
+
 scene = Scene(Path(DATASET_DEFAULT))
 
 
@@ -414,6 +433,37 @@ async def lifespan(_: FastAPI):
 
 
 application = FastAPI(title="GrayTech Security", version="0.1.0", lifespan=lifespan)
+
+
+@application.get("/calibration")
+def calibration() -> dict:
+    """
+    Threshold calibration panel.
+
+    The matching threshold was a hardcoded 0.45 - insightface's general default.
+    This reports where the errors actually are in observed traffic, and what the
+    threshold should be given them, so the number is measured rather than
+    inherited.
+    """
+    from app.calibration import calibrator
+    snap = calibrator.snapshot()
+    snap["recommend"] = calibrator.recommend()
+    snap["profiles"] = {k: v for k, v in snap.get("profiles", {}).items()
+                        if v.get("corrections")}
+    return snap
+
+
+@application.post("/calibration/apply")
+async def calibration_apply(req: dict) -> dict:
+    from app.calibration import calibrator
+    return calibrator.apply(req.get("threshold", 0.45))
+
+
+@application.get("/api/profiles")
+def profiles() -> dict:
+    from app.calibration import calibrator
+    return {"profiles": calibrator.profile_meta,
+            "note": "enrolled identities that have absorbed corrections"}
 
 
 @application.get("/health")
@@ -431,7 +481,11 @@ def health() -> dict:
 
 @application.get("/api/state")
 def state() -> dict:
-    return scene.snapshot()
+    s = scene.snapshot()
+    from app.calibration import calibrator
+    s["calibration"] = calibrator.snapshot()
+    s["calibration"]["recommend"] = calibrator.recommend()
+    return s
 
 
 @application.get("/api/events")
@@ -443,9 +497,22 @@ async def events_recent(limit: int = Query(60, ge=1, le=400)) -> dict:
 async def stream():
     """Server-sent events. One-directional, so SSE beats WebSocket here."""
     async def gen():
-        last_sent = 0.0
         while True:
             snap = scene.snapshot()
+            # Calibration rides along on the stream, not just on /api/state.
+            #
+            # This called scene.snapshot() directly, so the SSE payload had no
+            # 'calibration' key at all: /api/state returned 126 observations
+            # while the live stream carried none, and the panel stayed empty
+            # because drawCalibration(d.state.calibration) was being handed
+            # undefined. Enriching here rather than duplicating the enrichment
+            # means the stream and the REST endpoint can never disagree.
+            try:
+                from app.calibration import calibrator
+                snap["calibration"] = calibrator.snapshot()
+                snap["calibration"]["recommend"] = calibrator.recommend()
+            except Exception as exc:                      # noqa: BLE001
+                snap["calibration"] = {"error": str(exc)}
             recent = list(scene.events)[-40:]
             yield f"data: {json.dumps({'state': snap, 'events': recent})}\n\n"
             await asyncio.sleep(0.25)
@@ -526,6 +593,21 @@ button:hover{border-color:var(--cyn)}
     <strong style="display:block;margin-bottom:8px">Event log</strong>
     <div id="log"></div>
   </div>
+</div>
+
+<div class="card" style="margin-top:14px">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+    <strong>Recognition threshold &mdash; self-calibrating</strong>
+    <span id="calBadge" class="badge sim" style="display:none"></span>
+  </div>
+  <div class="note" style="margin-top:6px">
+    The match threshold decides when a face counts as an enrolled person. It is
+    not a guess: every score the system produces is logged, and the operating
+    point below is derived from where errors actually occur in this traffic.
+  </div>
+  <div class="kpis" style="margin-top:10px" id="calKpis"></div>
+  <div id="calRec" class="note" style="margin-top:8px"></div>
+  <div id="calProfiles" class="note" style="margin-top:6px"></div>
 </div>
 
 <div class="card" style="margin-top:14px">
@@ -693,8 +775,52 @@ es.onerror=()=>{document.getElementById('conn').textContent='reconnecting';
                 document.getElementById('conn').className='badge';};
 es.onmessage=(m)=>{
   const d=JSON.parse(m.data);
-  draw(d.state); drawKpis(d.state); drawLog(d.events);
+  draw(d.state); drawKpis(d.state); drawLog(d.events); drawCalibration(d.state.calibration);
 };
+
+function drawCalibration(c){
+  if(!c) return;
+  const badge=document.getElementById('calBadge');
+  const rec=c.recommend||{};
+  if(rec.ok && Math.abs((rec.delta||0))>=0.01){
+    badge.style.display='';
+    badge.textContent='adjustment suggested';
+  } else { badge.style.display='none'; }
+
+  const items=[
+    ['Threshold', (c.threshold!=null?c.threshold.toFixed(3):'—'),
+      rec.ok?'var(--amb)':''],
+    ['Observations', c.n!=null?c.n:'—', ''],
+    ['False accepts', c.false_accept!=null?c.false_accept:'—',
+      c.false_accept?'var(--red)':'var(--grn)'],
+    ['False rejects', c.false_reject!=null?c.false_reject:'—',
+      c.false_reject?'var(--amb)':'var(--grn)'],
+    ['Median score', c.p50!=null?c.p50.toFixed(3):'—', ''],
+    ['Accuracy', c.accuracy!=null?(c.accuracy*100).toFixed(1)+'%':'—',
+      c.accuracy!=null&&c.accuracy<1?'var(--amb)':'var(--grn)'],
+  ];
+  document.getElementById('calKpis').innerHTML = items.map(([l,v,col])=>
+    `<div class="kpi"><div class="lab">${l}</div><div class="val" style="color:${col||'var(--txt)'};font-size:20px">${v}</div></div>`
+  ).join('');
+
+  const box=document.getElementById('calRec');
+  if(rec.ok){
+    box.innerHTML = '<b class="mid">Recommendation:</b> move threshold '+
+      rec.current.toFixed(3)+' → <b>'+rec.recommended.toFixed(3)+'</b> &nbsp;'+ rec.reason +
+      ' <span style="color:var(--mut)">('+rec.caveat+')</span>';
+  } else {
+    box.innerHTML = '<span style="color:var(--mut)">Not enough evidence yet: '+
+      (rec.reason||'')+'</span>';
+  }
+
+  const learned=Object.entries(c.profiles||{});
+  document.getElementById('calProfiles').innerHTML = learned.length
+    ? '<b style="color:var(--grn)">Adaptive profiles:</b> '+ learned.map(([k,v])=>
+        k+' <span style="color:var(--mut)">('+(v.samples||0)+' sample'+
+        ((v.samples===1)?'':'s')+')</span>').join(', ') +
+      ' — these enrolled identities have absorbed corrections and are now matched against a refined vector.'
+    : '<span style="color:var(--mut)">No adaptive corrections recorded yet. Correcting a misidentification enriches that person\'s profile immediately, without retraining the network.</span>';
+}
 
 async function togglePause(){
   const r=await fetch('/api/pause',{method:'POST'});
