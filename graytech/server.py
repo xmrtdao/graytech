@@ -45,6 +45,7 @@ from typing import Optional
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 # Reuse the service that already exists. Same model, same matcher, same
 # threshold - importing rather than reimplementing is the point, so a change to
@@ -593,6 +594,14 @@ async def lifespan(_: FastAPI):
 
 application = FastAPI(title="GrayTech Security", version="0.1.0", lifespan=lifespan)
 
+# Slide imagery, served from the repo rather than inlined as base64. A handful
+# of JPEGs inlined would add ~4 MB to every page load; the OS already caches
+# these on disk and the browser caches them by URL.
+_ASSETS = Path(__file__).resolve().parent.parent / "deck-assets"
+if _ASSETS.is_dir():
+    application.mount("/deck-assets", StaticFiles(directory=str(_ASSETS)),
+                      name="deck-assets")
+
 
 @application.get("/calibration")
 def calibration() -> dict:
@@ -830,12 +839,40 @@ body{background:var(--ink);color:var(--paper);max-width:var(--maxw);margin:0 aut
 /* ---------- masthead ---------- */
 header.top{border-bottom:1px solid var(--line);margin:0 -28px 24px;padding:30px 28px 24px;
   background:radial-gradient(120% 90% at 78% 0%, rgba(201,162,39,.10), transparent 55%),var(--ink)}
+
+/* Hero: drone plate behind the wordmark, with a live telemetry strip. The image
+   is decorative and sits behind the text, so it is an empty alt on a CSS
+   background rather than a real <img> the reader has to skip. */
+header.hero{position:relative;overflow:hidden;padding:0;
+  border-bottom:1px solid var(--line);margin:0 -28px 22px}
+.hero-plate{position:absolute;inset:0;background:
+    url('/deck-assets/drone-cover.jpg') center 42%/cover no-repeat;
+  filter:saturate(.8) contrast(1.06)}
+.hero-plate::after{content:"";position:absolute;inset:0;background:
+    linear-gradient(180deg, rgba(13,15,12,.62) 0%, rgba(13,15,12,.86) 58%, var(--ink) 100%),
+    radial-gradient(120% 80% at 78% 6%, rgba(201,162,39,.16), transparent 55%)}
+.heroin{position:relative;z-index:2;padding:44px 28px 26px;max-width:var(--maxw);margin:0 auto}
 h1{font-family:'Saira Condensed',sans-serif;font-weight:700;font-size:clamp(30px,4.2vw,46px);
   line-height:1;text-transform:uppercase;letter-spacing:.01em;margin-top:12px;
   display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 h1 .g{color:var(--gold)}
 h1 .mark{width:26px;height:26px;flex:none}
 .tagline{color:var(--mute);font-weight:300;font-size:15.5px;margin-top:10px;max-width:640px}
+
+/* live telemetry strip in the hero - the same numbers the stages below report,
+   so the top of the page is alive before you scroll to anything */
+.hero-strip{display:flex;flex-wrap:wrap;gap:0;margin-top:22px;
+  border:1px solid var(--line-2);background:rgba(23,26,21,.72);backdrop-filter:blur(6px)}
+.hero-chip{padding:11px 18px;border-right:1px solid var(--line);min-width:112px}
+.hero-chip:last-child{border-right:0}
+.hero-chip .lab{font-family:'Space Mono',monospace;font-size:9.5px;letter-spacing:.2em;
+  text-transform:uppercase;color:var(--gold)}
+.hero-chip .val{font-family:'Saira Condensed',sans-serif;font-weight:700;font-size:24px;
+  line-height:1.1;margin-top:5px;color:var(--paper);font-variant-numeric:tabular-nums}
+@media(max-width:720px){
+  .hero-chip{flex:1 1 33%;min-width:0;padding:10px 12px}
+  .hero-chip:nth-child(3n){border-right:0}
+}
 .badge{font-family:'Space Mono',monospace;font-size:10px;letter-spacing:.16em;
   text-transform:uppercase;padding:4px 10px;border:1px solid var(--line-2);color:var(--mute);
   align-self:center}
@@ -1011,13 +1048,44 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style></head><body>
 
-<header class="top">
-  <span class="eyebrow">Gray Tech Solutions &middot; Situational Awareness</span>
-  <h1><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polygon points="32,7 57,32 32,57 7,32" fill="none" stroke="#C9A227" stroke-width="5"/><polygon points="32,20 44,32 32,44 20,32" fill="#C9A227"/><polygon points="32,27 37,32 32,37 27,32" fill="#0D0F0C"/></svg>Gray Tech <span class="g">Security</span>
-      <span class="badge live" id="conn">connecting</span></h1>
-  <p class="tagline">Face detection &amp; recognition over a monitored scene, with a match
-    threshold derived from observed traffic rather than a generic default.</p>
+<header class="hero">
+  <div class="hero-plate" role="img" aria-label="Airframe on station over a monitored perimeter at dusk"></div>
+  <div class="heroin">
+    <span class="eyebrow">Gray Tech Solutions &middot; Situational Awareness</span>
+    <h1><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polygon points="32,7 57,32 32,57 7,32" fill="none" stroke="#C9A227" stroke-width="5"/><polygon points="32,20 44,32 32,44 20,32" fill="#C9A227"/><polygon points="32,27 37,32 32,37 27,32" fill="#0D0F0C"/></svg>Gray Tech <span class="g">Security</span>
+        <span class="badge live" id="conn">connecting</span></h1>
+    <p class="tagline">Person detection first, identity second &mdash; over a monitored scene,
+      with a match threshold derived from observed traffic rather than a generic default.
+      Point stage 1 at your own camera and watch it work.</p>
+    <div class="hero-strip" id="heroStrip"></div>
+  </div>
 </header>
+
+<div class="card" style="margin-top:0" id="liveCard">
+  <div class="cardhead">
+    <div><span class="eyebrow">Stage 1 &middot; Live</span><h2>Your camera, tracked</h2></div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <select id="camSel" class="ctl" disabled><option>no camera yet</option></select>
+      <button id="camBtn" class="ctlbtn">Start camera</button>
+    </div>
+  </div>
+
+  <div class="hud" id="hud">
+    <video id="vid" playsinline muted autoplay></video>
+    <canvas id="hudc"></canvas>
+    <div class="hud-tl" id="hudId">STANDBY</div>
+    <div class="hud-telemetry" id="hudTel"></div>
+    <div class="hud-scan"></div>
+    <div class="hud-empty" id="hudEmpty">
+      <b>Camera off.</b> Nothing is being captured or sent.
+      Press <b>Start camera</b> to point stage 1 at your own device &mdash; the
+      browser will ask which one, including a front-facing camera. Frames go to
+      this server for person detection and come straight back as boxes; no
+      video is stored, nobody is enrolled, and no name is ever attached.
+    </div>
+  </div>
+  <div class="note" id="liveNote"></div>
+</div>
 
 <!-- Three stages, in pipeline order, each labelled with what it actually
      measures. A flat row of ten numbers cannot tell you that "Persons" and
@@ -1098,32 +1166,6 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
     <div class="kpis" id="pxKpis" style="margin-top:0"></div>
     <div class="note" id="pxNote"></div>
   </div>
-</div>
-
-<div class="card" style="margin-top:14px" id="liveCard">
-  <div class="cardhead">
-    <div><span class="eyebrow">Stage 1 &middot; Live</span><h2>Your camera, tracked</h2></div>
-    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <select id="camSel" class="ctl" disabled><option>no camera yet</option></select>
-      <button id="camBtn" class="ctlbtn">Start camera</button>
-    </div>
-  </div>
-
-  <div class="hud" id="hud">
-    <video id="vid" playsinline muted autoplay></video>
-    <canvas id="hudc"></canvas>
-    <div class="hud-tl" id="hudId">STANDBY</div>
-    <div class="hud-telemetry" id="hudTel"></div>
-    <div class="hud-scan"></div>
-    <div class="hud-empty" id="hudEmpty">
-      <b>Camera off.</b> Nothing is being captured or sent.
-      Press <b>Start camera</b> to point stage 1 at your own device &mdash; the
-      browser will ask which one, including a front-facing camera. Frames go to
-      this server for person detection and come straight back as boxes; no
-      video is stored, nobody is enrolled, and no name is ever attached.
-    </div>
-  </div>
-  <div class="note" id="liveNote"></div>
 </div>
 
 <div class="card" style="margin-top:14px">
@@ -1640,6 +1682,19 @@ function drawKpis(s){
     (off>0? ', '+off+' walking on or off':'')+
     (s.edge? ', '+s.edge+' at the edge':'')+' &middot; '+
     'model '+(paused?'<span class="mid">paused</span>':'<span class="ok">running</span>');
+
+  // Hero strip - the same figures, so the top of the page is alive on arrival.
+  const chips=[
+    ['In frame', inFrame, 'var(--gold)'],
+    ['People seen', sp.detections ?? 0, (sp.detections?'var(--cyn)':'')],
+    ['Named', st.identified ?? 0, 'var(--grn)'],
+    ['Face size', px.observed_median? Math.round(px.observed_median)+'px':'—', ''],
+    ['Scan', (s.scan_ms||0).toFixed(0)+'ms', ''],
+    ['Uptime', Math.floor((s.uptime||0)/60)+'m '+Math.floor((s.uptime||0)%60)+'s', ''],
+  ];
+  document.getElementById('heroStrip').innerHTML = chips.map(([l,v,c])=>
+    '<div class="hero-chip"><div class="lab">'+l+'</div>'+
+    '<div class="val" style="color:'+(c||'var(--paper)')+'">'+v+'</div></div>').join('');
 }
 
 function drawLog(evs){
