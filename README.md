@@ -116,6 +116,22 @@ Ollama and cloud models — none of it touches this.
 - Live calibration panel with threshold, observations, FA/FR rates, accuracy
 - Pause / resume
 - Works on desktop and phone
+- **Styling** is aligned to [graytechsolutions.dev](https://graytechsolutions.dev) —
+  same olive-ink surfaces (`--ink #0D0F0C`), 1px rules, square corners, gold
+  accent, and the Saira Condensed / Barlow / Space Mono scale — so the operator
+  console and the public site read as one product. The five **state** colours are
+  the deliberate exception: green / red / amber / cyan / violet carry meaning
+  here (matched, unknown, calibration warning, entry, exit), so they are retuned
+  warm to sit on olive rather than collapsed into the gold. `:root` is the single
+  source of truth; the canvas reads its palette back out of the stylesheet via
+  `getComputedStyle` instead of hard-coding hex.
+- **Presentation workspace workup** — the aerial-biometrics field workup is
+  rendered as a section on the dashboard (6 collapsible cards, 7 tables). It
+  describes a *different airframe* (10–30× optical gimbal, Jetson Orin NX), is
+  **not** a measurement of this system, and its quoted accuracy figures come from
+  cited third-party UAV studies. Its licence and legal limits — InsightFace
+  packs are non-commercial, EU AI Act exposure — are surfaced in the page rather
+  than buried, because they are load-bearing for anyone planning to build on it.
 
 ### Camera sources
 
@@ -298,6 +314,12 @@ plainly rather than claiming the model gets smarter on its own.
 **Calibration is provisional.** It is derived from observed traffic, not a
 held-out set, and a recommendation from a few dozen observations is a starting
 point, not a final answer.
+
+**The aerial workup on the dashboard is not this system.** It is a field writeup
+on a different airframe — optical gimbal, Jetson, long-range identification. None
+of its numbers were produced here, and nothing in it raises the accuracy figure
+on this dashboard. It is published next to the console so the honest limits travel
+with the capability.
 
 **Known issues, all fixed but recorded here because they were instructive:**
 
