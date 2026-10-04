@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 # Reuse the service that already exists. Same model, same matcher, same
@@ -51,6 +51,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 # app/ changes this dashboard too.
 import app as faceapp
 from app import IDENTITY_DIR, face as recogniser
+from app.personfind import Tracker, personfinder
 
 DATASET_DEFAULT = r"C:\Users\PureTrek\Desktop\Faces\Faces"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -58,6 +59,24 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 SCENE_W, SCENE_H = 960, 540
 SCAN_X = SCENE_W * 0.5          # the scan line, people walk through here
 HEAD_R = 26                      # head radius on the stick figure
+BODY_BOTTOM = 96                 # the stick figure's feet, at y + 96
+# Spawn just off the leading edge and cull just past the trailing one. This is
+# the walk-on effect; the important part is that these in-flight visitors are
+# NOT counted, because the dashboard number has to equal the number of people
+# actually on screen.
+SPAWN_X = -(HEAD_R + 30)
+CULL_X = SCENE_W + HEAD_R + 40
+
+
+def in_frame(v) -> bool:
+    """True while any part of this visitor is actually on the canvas.
+
+    The KPI used to be len(self.visitors), which counts people mid-approach at
+    x=-52 and people already walking off at x=1070 on a canvas that spans
+    0..960. It read 7 while five figures were on screen. Count what is drawn.
+    """
+    return (v.x + HEAD_R >= 0 and v.x - HEAD_R <= SCENE_W
+            and v.y + BODY_BOTTOM >= 0 and v.y - HEAD_R <= SCENE_H)
 
 # Face thumbnails. Cached because the same 31 portraits are re-used constantly
 # and decoding a JPEG per visitor per frame at 20Hz would dominate the sim loop.
@@ -142,6 +161,23 @@ class Visitor:
     live: bool = False          # True when this visitor is a live webcam frame
     frame: Optional[bytes] = None
     born: float = field(default_factory=time.time)
+    # Pixel budget, measured on the crop that actually reached the model rather
+    # than inferred from the scene. This is the number the rig spec turns on.
+    face_px: Optional[float] = None
+    iod_px: Optional[float] = None
+    sharpness: Optional[float] = None
+    band: str = "unmeasured"
+    # Set when the quality gate refused to score this crop. A refused crop is
+    # NOT an unknown person: counting it as one is how a system ends up
+    # reporting "unknown" for a face it never had the pixels to judge.
+    gated: bool = False
+    gate_reason: str = ""
+    # Stage 1's verdict on this person, counted without reference to the face
+    # pipeline. Kept in its own fields so a YOLO count can never be mistaken for
+    # a face result, or vice versa.
+    yolo_persons: int = 0
+    yolo_ok: bool = False
+    yolo_ms: float = 0.0
 
     def tick(self, dt: float) -> bool:
         """Advance position. Returns False when they have left the scene."""
@@ -149,7 +185,13 @@ class Visitor:
         self.y += self.vy * dt
         # gentle vertical drift so the walk is not a perfectly straight line
         self.y += np.sin((time.time() - self.born) * 1.4) * 0.06
-        if self.x < -140 or self.x > SCENE_W + 140:
+        # Clamp the walk to the canvas. That sine term is a random walk applied
+        # every tick, and over a long visit it accumulates: a visitor loitering
+        # long enough ended up at y=536 on a 540-tall scene, feet at 632, off
+        # the bottom of the picture while still counted as present.
+        self.y = max(HEAD_R + 6.0,
+                     min(SCENE_H - BODY_BOTTOM - 6.0, self.y))
+        if self.x > CULL_X or self.x < SPAWN_X - 40:
             return False
         return True
 
@@ -168,7 +210,7 @@ class Scene:
         self._stop = threading.Event()
         self.stats = {
             "entered": 0, "exited": 0, "identified": 0,
-            "unknown": 0, "started_at": time.time(),
+            "unknown": 0, "gated": 0, "started_at": time.time(),
         }
         self.scan_ms = 0.0
         # Live camera mode. OFF by default so a demo never opens a stranger's
@@ -179,11 +221,23 @@ class Scene:
         self.cam_status = "off"
         self.cam_frame: Optional[bytes] = None
         self.cam_at = 0.0
+        # Latest YOLO person-find result for the live scene. Empty dict until
+        # the camera is switched on, which is what the dashboard keys off.
+        self.cam_persons: dict = {}
+        # YOLO's own tallies, accumulated across the walk. These are counted by
+        # the detector alone: no gallery, no face model, no match threshold.
+        self.yolo_seen = 0          # frames where stage 1 ran
+        self.yolo_person_hits = 0   # person detections across those frames
+        self.yolo_per_visitor: dict = {}
 
     # -- helpers ----------------------------------------------------------
     def log(self, kind: str, **kw) -> None:
         ev = {"kind": kind, "t": time.time(), **kw}
         self.events.append(ev)
+
+    def in_frame_count(self) -> int:
+        """How many visitors are actually on the canvas right now."""
+        return sum(1 for v in self.visitors if in_frame(v))
 
     def candidates(self) -> list[Path]:
         if not self.dataset.is_dir():
@@ -225,6 +279,9 @@ class Scene:
         self.cam_status = f"live - {self.cam_name}"
         self.cam_frame = data
         self.cam_at = time.time()
+        # Stage 1 of the rig loop, run where there is an actual scene to read,
+        # with the tracker advanced one frame per capture.
+        self.cam_persons = personfinder.detect_bytes_tracked(data)
         return data
 
     def spawn(self) -> Optional[Visitor]:
@@ -238,7 +295,7 @@ class Scene:
                 return None
             v = Visitor(
                 name="live camera", file="(webcam)",
-                x=-120 if from_left else SCENE_W + 120, y=y,
+                x=SPAWN_X if from_left else CULL_X, y=y,
                 vx=self.speed * 0.9 * (1 if from_left else -1),
                 vy=random.uniform(-4, 4),
                 entering=from_left, live=True, frame=data,
@@ -259,7 +316,7 @@ class Scene:
         v = Visitor(
             name=faceapp_synth_name(p.stem),
             file=str(p),
-            x=-120 if from_left else SCENE_W + 120,
+            x=SPAWN_X if from_left else CULL_X,
             y=y,
             vx=self.speed * random.uniform(0.85, 1.15) * (1 if from_left else -1),
             vy=random.uniform(-6, 6),
@@ -290,6 +347,18 @@ class Scene:
             except OSError as e:
                 self.log("error", name=v.name, detail=str(e))
                 return
+        # ── Stage 1: YOLO person-find, counted on its own ────────────────────
+        # Deliberately independent of the face pipeline below. This number is
+        # produced without the gallery, without the face model and without the
+        # match threshold, so it stands on its own when the gallery is empty -
+        # which is the normal case for search and rescue.
+        yres = personfinder.detect_bytes(data)
+        self.yolo_seen += 1
+        self.yolo_person_hits += yres.get("count", 0)
+        v.yolo_persons = yres.get("count", 0)
+        v.yolo_ok = bool(yres.get("ok"))
+        v.yolo_ms = yres.get("ms", 0.0)
+
         t0 = time.perf_counter()
         try:
             faces, matrix = recogniser.embed(data)
@@ -304,6 +373,38 @@ class Scene:
             self.stats["unknown"] += 1
             self.log("scan", name=v.name, detected=False, matched=False)
             return
+
+        # ── Quality gate ────────────────────────────────────────────────────
+        # The rig spec's most load-bearing line is that a quality gate matters
+        # more than model choice. This is that gate, and it runs BEFORE the
+        # match so a below-spec crop can never produce a confident identity.
+        #
+        # It has to come first. Scoring a 14px face and then discarding the
+        # result still spends the calibration a wrong answer would have
+        # poisoned, and "UNKNOWN" for a face we could not resolve is a claim.
+        face = faces[0]
+        v.face_px = face.get("face_px")
+        v.iod_px = face.get("iod_px")
+        v.sharpness = face.get("sharpness")
+        v.band = face.get("band") or "unmeasured"
+
+        reasons = []
+        if v.face_px is not None and v.face_px < faceapp.PX_DETECT:
+            reasons.append(f"face {v.face_px:.0f}px < {faceapp.PX_DETECT:.0f}px floor")
+        if (v.sharpness is not None
+                and v.sharpness < faceapp.SHARPNESS_MIN):
+            reasons.append(
+                f"sharpness {v.sharpness:.0f} < {faceapp.SHARPNESS_MIN:.0f}")
+        if reasons:
+            v.scanned = True
+            v.matched = False
+            v.gated = True
+            v.gate_reason = "; ".join(reasons)
+            self.stats["gated"] = self.stats.get("gated", 0) + 1
+            self.log("gated", name=v.name, reason=v.gate_reason,
+                     face_px=v.face_px, band=v.band)
+            return
+        v.gated = False
 
         # RECORD every outcome for calibration. match_recorded takes the name we
         # believe is correct, which is what turns a raw score into a labelled
@@ -326,6 +427,7 @@ class Scene:
             self.stats["unknown"] += 1
         self.log("scan", name=v.name, detected=True,
                  matched=v.matched, confidence=v.confidence,
+                 face_px=v.face_px, iod_px=v.iod_px, band=v.band,
                  ms=round(self.scan_ms, 1))
 
     # -- main loop --------------------------------------------------------
@@ -353,9 +455,12 @@ class Scene:
                              confidence=v.confidence)
             self.visitors = survivors
 
-            # spawn cadence: never above max_present, and not faster than the UI can use
+            # Spawn cadence: fill the *visible* scene to max_present, not the
+            # tracked list. Gating on len(self.visitors) let the cap be eaten by
+            # people still walking on from off-canvas, so the scene topped out at
+            # five visible figures while the counter said seven.
             if now >= spawn_at:
-                if len(self.visitors) < self.max_present:
+                if self.in_frame_count() < self.max_present:
                     self.spawn()
                 spawn_at = now + random.uniform(1.6, 4.2)
 
@@ -373,27 +478,77 @@ class Scene:
 
     # -- snapshot for the UI ---------------------------------------------
     def snapshot(self) -> dict:
+        present = [{
+            "name": v.name,
+            "x": round(v.x, 1),
+            "y": round(v.y, 1),
+            "scanned": v.scanned,
+            "matched": v.matched,
+            "confidence": (round(v.confidence, 3)
+                           if v.confidence is not None else None),
+            "entering": v.entering,
+            "live": v.live,
+            # Pixel budget for this person, measured on the crop that reached
+            # the model. The canvas draws the face width under the name so the
+            # operator can see WHY a match is or is not trustworthy.
+            "face_px": v.face_px,
+            "iod_px": v.iod_px,
+            "sharpness": v.sharpness,
+            "band": v.band,
+            "gated": v.gated,
+            "gate_reason": v.gate_reason,
+            # Stage 1, per visitor, on its own terms.
+            "yolo_persons": v.yolo_persons,
+            "yolo_ok": v.yolo_ok,
+            "yolo_ms": v.yolo_ms,
+            # Face portrait for the head of the stick figure. Sent only for
+            # visitors who exist in a known file; live webcam frames carry
+            # their own image instead.
+            "face": None if v.live else thumb_data_uri(v.file),
+            # A webcam visitor carries its own frame, shown inside the head so
+            # the client can see it is live rather than a stored portrait.
+            "liveFrame": ("data:image/jpeg;base64," +
+                          base64.b64encode(v.frame).decode()) if (v.live and v.frame) else None,
+        } for v in self.visitors]
+
+        # Observed pixel budget for everyone in frame, next to the spec floors.
+        # Reported side by side so the gap between what this rig delivers and
+        # what the target rig needs is visible instead of asserted.
+        measured = sorted(v.face_px for v in self.visitors if v.face_px)
+        iods = sorted(v.iod_px for v in self.visitors if v.iod_px)
+        pixel = {
+            "spec": faceapp.pixel_budget(),
+            "observed_min": measured[0] if measured else None,
+            "observed_median": measured[len(measured) // 2] if measured else None,
+            "iod_median": iods[len(iods) // 2] if iods else None,
+            "gated_now": sum(1 for v in self.visitors if v.gated),
+            "gated_total": self.stats.get("gated", 0),
+        }
         return {
-            "present": [{
-                "name": v.name,
-                "x": round(v.x, 1),
-                "y": round(v.y, 1),
-                "scanned": v.scanned,
-                "matched": v.matched,
-                "confidence": (round(v.confidence, 3)
-                               if v.confidence is not None else None),
-                "entering": v.entering,
-                "live": v.live,
-                # Face portrait for the head of the stick figure. Sent only for
-                # visitors who exist in a known file; live webcam frames carry
-                # their own image instead.
-                "face": None if v.live else thumb_data_uri(v.file),
-                # A webcam visitor carries its own frame, shown inside the head so
-                # the client can see it is live rather than a stored portrait.
-                "liveFrame": ("data:image/jpeg;base64," +
-                              base64.b64encode(v.frame).decode()) if (v.live and v.frame) else None,
-            } for v in self.visitors],
+            "present": present,
+            # The number on the dashboard is the number on the canvas. People
+            # mid-walk at x=-52 or x=1070 are tracked but not counted here.
+            "in_frame": self.in_frame_count(),
+            # Of those in frame, how many are only partway on/off an edge. Worth
+            # saying out loud: "7 in frame" with three of them half off the right
+            # edge is a different claim from seven people fully on the canvas.
+            "edge": sum(1 for v in self.visitors
+                        if in_frame(v) and not (0 <= v.x <= SCENE_W)),
+            "tracked": len(present),
             "stats": dict(self.stats),
+            "pixel": pixel,
+            # Stage 1 of the rig loop, and whether it is even loaded. The tallies here
+            # are YOLO's alone - no gallery, no face model, no threshold.
+            "person": {
+                "available": personfinder.available,
+                "detail": personfinder.detail,
+                "frames": self.yolo_seen,
+                "detections": self.yolo_person_hits,
+                "hit_rate": (round(self.yolo_person_hits / self.yolo_seen, 2)
+                             if self.yolo_seen else None),
+                "live": self.cam_persons or None,
+                "tracks": (self.cam_persons or {}).get("tracks") or [],
+            },
             "scan_ms": round(self.scan_ms, 1),
             "scan_x": SCAN_X,
             "scene": {"w": SCENE_W, "h": SCENE_H},
@@ -427,6 +582,10 @@ scene = Scene(Path(DATASET_DEFAULT))
 async def lifespan(_: FastAPI):
     recogniser.load()
     recogniser.reload_identities()
+    # Stage 1 of the rig loop. Loaded once here, never per request, and
+    # non-fatal: if the weights are missing the console still runs and the
+    # dashboard says so rather than pretending the stage exists.
+    personfinder.load()
     scene.start()
     yield
     scene.stop()
@@ -464,6 +623,99 @@ def profiles() -> dict:
     from app.calibration import calibrator
     return {"profiles": calibrator.profile_meta,
             "note": "enrolled identities that have absorbed corrections"}
+
+
+@application.post("/api/persons")
+async def persons(file: UploadFile = File(...)) -> dict:
+    """
+    Stage 1 on demand: YOLO person detection on one uploaded scene frame.
+
+    This is the cheap gate that sits in front of the face models. It is the only
+    route that exercises the stage on imagery you choose, which matters because
+    YOLO wants a scene and returns near-nothing on a tight headshot crop.
+    """
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "empty upload")
+    return personfinder.detect_bytes(data)
+
+
+@application.get("/api/persons/status")
+def persons_status() -> dict:
+    """Whether stage 1 is loaded, and what it last saw."""
+    return {"available": personfinder.available, "detail": personfinder.detail,
+            "conf_thresh": personfinder.conf}
+
+
+# ── Live HUD ingest ─────────────────────────────────────────────────────────
+# The browser owns the camera. It sends frames here for stage 1 and gets boxes
+# and track IDs back, which it draws over its own <video>.
+#
+# This replaces the old server-side ffmpeg/DirectShow capture as the primary
+# path, for two reasons. It needs no ffmpeg on the host, and it lets the person
+# watching pick their own camera - including a front-facing one - through the
+# browser's own device picker, which the server could never do because it had
+# no way to know what they had plugged in.
+#
+# Trackers are per session id. Two people watching at once must not share track
+# IDs, or "TRACK 3" means different humans in different browsers.
+_LIVE_TRACKERS: dict[str, tuple[float, Tracker]] = {}
+_LIVE_LOCK = threading.Lock()
+_LIVE_TTL = 300.0          # drop an idle session's tracker after this
+
+
+def _live_tracker(session: str) -> Tracker:
+    now = time.time()
+    with _LIVE_LOCK:
+        # Opportunistic sweep. Cheap because the dict only ever holds the
+        # sessions currently connected.
+        for sid in [s for s, (t, _) in _LIVE_TRACKERS.items() if now - t > _LIVE_TTL]:
+            _LIVE_TRACKERS.pop(sid, None)
+        hit = _LIVE_TRACKERS.get(session)
+        if hit is None:
+            tr = Tracker()
+            _LIVE_TRACKERS[session] = (now, tr)
+            return tr
+        _LIVE_TRACKERS[session] = (now, hit[1])
+        return hit[1]
+
+
+@application.post("/api/live/frame")
+async def live_frame(file: UploadFile = File(...), session: str = "default") -> dict:
+    """
+    One frame from the viewer's own camera: detect, track, hand back boxes.
+
+    Detection and tracking only. This endpoint does not enrol anybody, does not
+    touch the identity gallery, and returns no names - which is why it is safe
+    to point at a camera in a room that happens to contain the person reading
+    this page.
+    """
+    if not personfinder.available:
+        raise HTTPException(503, f"stage 1 unavailable: {personfinder.detail}")
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "empty frame")
+    if len(data) > faceapp.MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "frame too large")
+
+    import cv2
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(400, "undecodable frame")
+
+    res = personfinder.detect(img)
+    res["tracks"] = _live_tracker(session).update(res.get("persons") or [])
+    res["track_count"] = len(res["tracks"])
+    res["frame"] = {"w": int(img.shape[1]), "h": int(img.shape[0])}
+    return res
+
+
+@application.post("/api/live/stop")
+def live_stop(session: str = "default") -> dict:
+    """Forget a session's tracks so IDs restart clean next time."""
+    with _LIVE_LOCK:
+        _LIVE_TRACKERS.pop(session, None)
+    return {"ok": True, "stopped": session}
 
 
 @application.get("/health")
@@ -541,7 +793,7 @@ def index() -> HTMLResponse:
 UI_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GrayTech Security</title>
+<title>Gray Tech Security</title>
 <meta name="description" content="Face detection and recognition over a monitored scene, with a self-calibrating match threshold.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%230D0F0C'/%3E%3Cpolygon points='32,7 57,32 32,57 7,32' fill='none' stroke='%23C9A227' stroke-width='5'/%3E%3Cpolygon points='32,20 44,32 32,44 20,32' fill='%23C9A227'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -608,6 +860,29 @@ h1 .mark{width:26px;height:26px;flex:none}
 .kpi .val{font-family:'Saira Condensed',sans-serif;font-weight:700;font-size:30px;line-height:1;
   margin-top:8px;font-variant-numeric:tabular-nums;color:var(--paper)}
 
+/* ---------- the three stages, side by side ---------- */
+.stages{display:grid;grid-template-columns:repeat(3,1fr);gap:0;margin-top:22px;
+  border:1px solid var(--line);background:var(--ink-3)}
+@media(max-width:900px){.stages{grid-template-columns:1fr}}
+.stage{padding:18px 20px;border-right:1px solid var(--line)}
+.stage:last-child{border-right:0}
+@media(max-width:900px){.stage{border-right:0;border-bottom:1px solid var(--line)}
+  .stage:last-child{border-bottom:0}}
+.stagename{font-family:'Saira Condensed',sans-serif;font-weight:600;font-size:21px;
+  text-transform:uppercase;letter-spacing:.02em;margin-top:4px;color:var(--paper)}
+.stagename em{font-style:normal;color:var(--gold);font-family:'Space Mono',monospace;
+  font-size:10.5px;letter-spacing:.14em;margin-left:9px;vertical-align:middle}
+.stagewhat{color:var(--mute);font-weight:300;font-size:13px;line-height:1.55;margin-top:14px;
+  padding-top:12px;border-top:1px solid var(--line)}
+.stagewhat b{color:var(--paper);font-weight:500}
+.scenebar{display:flex;flex-wrap:wrap;gap:10px 26px;margin-top:14px;padding:12px 2px 0;
+  border-top:1px solid var(--line)}
+.scenebar .kpi{padding:0;border:0;background:none}
+.howline{color:var(--mute);font-weight:300;font-size:13.5px;line-height:1.6;margin-top:14px;
+  max-width:900px}
+.howline b{color:var(--paper);font-weight:500}
+.howline .g{color:var(--gold)}
+
 canvas{width:100%;display:block;background:var(--ink);border:1px solid var(--line-2)}
 #log{max-height:330px;overflow-y:auto;font-family:'Space Mono',monospace;font-size:12px;line-height:1.7}
 .ev{padding:4px 0;border-bottom:1px solid rgba(236,237,230,.05);display:flex;gap:10px}
@@ -625,6 +900,43 @@ button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
 
 .note{color:var(--mute);font-weight:300;font-size:14px;line-height:1.6;margin-top:12px}
 .note b{color:var(--paper);font-weight:500}
+
+/* ---------- live HUD ---------- */
+.ctl{background:var(--ink-3);color:var(--paper);border:1px solid var(--line-2);
+  font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.1em;padding:8px 12px}
+.ctl:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+.ctlbtn{background:var(--gold);color:var(--ink);border:1px solid var(--gold)}
+.ctlbtn:hover{background:var(--gold-bright);border-color:var(--gold-bright);color:var(--ink)}
+.hud{position:relative;background:#050706;border:1px solid var(--line-2);
+  aspect-ratio:16/9;overflow:hidden}
+.hud video,.hud canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.hud video{filter:saturate(.85) contrast(1.05)}
+.hud-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  text-align:center;padding:28px;color:var(--mute);font-weight:300;font-size:14px;
+  line-height:1.7;background:repeating-linear-gradient(45deg,
+    rgba(255,255,255,.012) 0 12px, transparent 12px 24px)}
+.hud-empty b{color:var(--paper);font-weight:500}
+.hud-empty[hidden]{display:none}
+/* corner brackets, the way a tracker HUD frames a subject */
+.hud::before,.hud::after{content:"";position:absolute;width:26px;height:26px;
+  border:2px solid var(--gold);opacity:.75;pointer-events:none;z-index:3}
+.hud::before{top:10px;left:10px;border-right:0;border-bottom:0}
+.hud::after{bottom:10px;right:10px;border-left:0;border-top:0}
+.hud-tl{position:absolute;top:12px;left:44px;z-index:4;
+  font-family:'Space Mono',monospace;font-size:10.5px;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--gold);background:rgba(5,7,6,.72);
+  border:1px solid var(--line);padding:4px 9px}
+.hud-telemetry{position:absolute;left:12px;top:44px;z-index:4;display:flex;
+  flex-direction:column;gap:1px;font-family:'Space Mono',monospace;font-size:10px;
+  letter-spacing:.1em;text-transform:uppercase;pointer-events:none}
+.hud-telemetry span{background:rgba(5,7,6,.72);border:1px solid var(--line);
+  padding:3px 8px;color:var(--mute)}
+.hud-telemetry span b{color:var(--gold);font-weight:400;margin-left:8px}
+.hud-scan{position:absolute;left:0;right:0;height:2px;z-index:2;pointer-events:none;
+  background:linear-gradient(90deg,transparent,rgba(201,162,39,.5),transparent);
+  animation:hudscan 5.5s linear infinite}
+@keyframes hudscan{0%{top:2%;opacity:0}8%{opacity:1}92%{opacity:1}100%{top:98%;opacity:0}}
+@media(prefers-reduced-motion:reduce){.hud-scan{display:none}}
 
 /* ---------- workup: catalog pattern from the public site ---------- */
 #workup{margin-top:44px}
@@ -701,13 +1013,45 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
 
 <header class="top">
   <span class="eyebrow">Gray Tech Solutions &middot; Situational Awareness</span>
-  <h1><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polygon points="32,7 57,32 32,57 7,32" fill="none" stroke="#C9A227" stroke-width="5"/><polygon points="32,20 44,32 32,44 20,32" fill="#C9A227"/><polygon points="32,27 37,32 32,37 27,32" fill="#0D0F0C"/></svg>GrayTech <span class="g">Security</span>
+  <h1><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polygon points="32,7 57,32 32,57 7,32" fill="none" stroke="#C9A227" stroke-width="5"/><polygon points="32,20 44,32 32,44 20,32" fill="#C9A227"/><polygon points="32,27 37,32 32,37 27,32" fill="#0D0F0C"/></svg>Gray Tech <span class="g">Security</span>
       <span class="badge live" id="conn">connecting</span></h1>
   <p class="tagline">Face detection &amp; recognition over a monitored scene, with a match
     threshold derived from observed traffic rather than a generic default.</p>
 </header>
 
-<div class="kpis" id="kpis"></div>
+<!-- Three stages, in pipeline order, each labelled with what it actually
+     measures. A flat row of ten numbers cannot tell you that "Persons" and
+     "Identified" come from different models answering different questions. -->
+<div class="stages">
+  <div class="stage">
+    <span class="eyebrow">Stage 1 &middot; Count</span>
+    <div class="stagename">Find <em>YOLO</em></div>
+    <div class="kpis" id="kpis1" style="margin-top:14px"></div>
+    <p class="stagewhat"><b>Counts people.</b> Runs on the image alone &mdash; no
+      gallery, no face model, no match threshold. A person here is a
+      <b>body detected</b>, never a name. Works with an empty gallery.</p>
+  </div>
+  <div class="stage">
+    <span class="eyebrow">Stage 2 &middot; Check</span>
+    <div class="stagename">Gate <em>PIXEL BUDGET</em></div>
+    <div class="kpis" id="kpis2" style="margin-top:14px"></div>
+    <p class="stagewhat"><b>Refuses crops it cannot judge.</b> Face width and
+      sharpness are measured before matching; too small or too blurred and the
+      crop is dropped as <b>gated</b>, not logged as an unknown person.</p>
+  </div>
+  <div class="stage">
+    <span class="eyebrow">Stage 3 &middot; Name</span>
+    <div class="stagename">Identify <em>BUFFALO</em></div>
+    <div class="kpis" id="kpis3" style="margin-top:14px"></div>
+    <p class="stagewhat"><b>Names a face, and only an enrolled one.</b> A 512-d
+      embedding matched against references you enrolled. No match means
+      <b>unknown</b>, which is an honest miss &mdash; not a person stage 1
+      counted.</p>
+  </div>
+</div>
+
+<div class="scenebar kpis" id="kpis"></div>
+<p class="howline" id="howline"></p>
 
 <div class="row">
   <div class="card grow">
@@ -739,6 +1083,49 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
   <div id="calProfiles" class="note" style="margin-top:6px"></div>
 </div>
 
+<div class="row" style="margin-top:14px">
+  <div class="card grow">
+    <div class="cardhead">
+      <div><span class="eyebrow">Stage 1 &middot; Find</span><h2>Person detection &mdash; YOLO</h2></div>
+    </div>
+    <div class="kpis" id="yoloKpis" style="margin-top:0"></div>
+    <div class="note" id="yoloNote"></div>
+  </div>
+  <div class="card grow">
+    <div class="cardhead">
+      <div><span class="eyebrow">Stage 2 &middot; Gate</span><h2>Pixel budget</h2></div>
+    </div>
+    <div class="kpis" id="pxKpis" style="margin-top:0"></div>
+    <div class="note" id="pxNote"></div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:14px" id="liveCard">
+  <div class="cardhead">
+    <div><span class="eyebrow">Stage 1 &middot; Live</span><h2>Your camera, tracked</h2></div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <select id="camSel" class="ctl" disabled><option>no camera yet</option></select>
+      <button id="camBtn" class="ctlbtn">Start camera</button>
+    </div>
+  </div>
+
+  <div class="hud" id="hud">
+    <video id="vid" playsinline muted autoplay></video>
+    <canvas id="hudc"></canvas>
+    <div class="hud-tl" id="hudId">STANDBY</div>
+    <div class="hud-telemetry" id="hudTel"></div>
+    <div class="hud-scan"></div>
+    <div class="hud-empty" id="hudEmpty">
+      <b>Camera off.</b> Nothing is being captured or sent.
+      Press <b>Start camera</b> to point stage 1 at your own device &mdash; the
+      browser will ask which one, including a front-facing camera. Frames go to
+      this server for person detection and come straight back as boxes; no
+      video is stored, nobody is enrolled, and no name is ever attached.
+    </div>
+  </div>
+  <div class="note" id="liveNote"></div>
+</div>
+
 <div class="card" style="margin-top:14px">
   <div class="cardhead"><div><span class="eyebrow">Scope</span><h2>About this demo</h2></div></div>
   <p class="note" style="margin-top:0">
@@ -765,25 +1152,33 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
 
 <!-- ============ PRESENTATION WORKSPACE WORKUP ============ -->
 <section id="workup">
-  <span class="eyebrow">Field Workup &middot; Aerial Biometrics</span>
-  <h2 class="wtitle">The recognition <span class="g">stack that actually holds up</span></h2>
-  <p class="wlede">There is no single open-source &ldquo;drone facial-recognition product.&rdquo;
-    The stack actually in use in 2026 is a <b>detect &rarr; optically zoom &rarr; align &rarr;
-    embed &rarr; search</b> pipeline, not a Haar-cascade Tello demo. Digital zoom does not
-    substitute for optical zoom: it interpolates pixels that were never captured. Identity
-    matching from the air is a pixel-budget problem first and a model problem second.</p>
+  <span class="eyebrow">The build &middot; Aerial Biometrics</span>
+  <h2 class="wtitle">Bottom line <span class="g">up front</span></h2>
+  <p class="wlede">The open-source solution used by people who care about accuracy is
+    <b>YOLO (find) + optical zoom gimbal (pixels) + InsightFace SCRFD/ArcFace (identify) +
+    FAISS (search) + ByteTrack (temporal)</b>, running TensorRT on a Jetson Orin NX, with a
+    10&ndash;30&times; optical camera (SIYI ZR10/ZR30 or Viewpro 30&times;). Everything else is
+    either a toy tracker or a ground-station batch job.</p>
+  <p class="wlede"><b>Most missions do not need identity.</b> For search and rescue the useful
+    system is <b>YOLO-person + thermal + optical zoom</b> &mdash; that is person detection, not
+    face recognition (TEXSAR&rsquo;s ADIAT is the open-source SAR image tool). ArcFace earns its
+    place only against a consented, small gallery: a missing person, authorised crew. So this
+    build leads with <b>find</b>, gates on the <b>pixel budget</b>, and treats identity as the
+    optional third stage.</p>
 
-  <div class="callout warn">
-    <span class="h">Read this first &mdash; scope</span>
-    <p>This workup describes a <b>different airframe</b>: a 7&ndash;10&Prime; quad carrying a
-      10&ndash;30&times; optical gimbal and a Jetson Orin NX. It is <b>not</b> a measurement of
-      the console above, which is a fixed ground camera running <code>buffalo_s</code> on CPU
-      via onnxruntime. Nothing here raises the accuracy figure shown in this console, and the
-      figures quoted below come from cited third-party UAV studies, not from this system.</p>
-    <p>It is included because it is the honest answer to &ldquo;how far can this go, and what
-      would it actually take?&rdquo; &mdash; and because its licensing and legal limits are
-      load-bearing for anyone planning to build on it.</p>
-  </div>
+  <div class="subhead">Where this console stands against that spec</div>
+  <table class="wt">
+    <tr><th>Stage</th><th>Spec</th><th>This console, today</th><th>Status</th></tr>
+    <tr><td>1 &middot; Find</td><td>YOLO person on a wide frame, gating everything after it</td><td>yolov8n on onnxruntime, reads the live scene; <code>POST /api/persons</code></td><td><span class="ok">live</span></td></tr>
+    <tr><td>2 &middot; Gate</td><td>Quality gate before matching &mdash; blur, pose, face size</td><td>Face width, IOD and Laplacian sharpness measured per crop; refused before match</td><td><span class="ok">live</span></td></tr>
+    <tr><td>3 &middot; Identify</td><td>SCRFD &rarr; align &rarr; ArcFace (buffalo_l / antelopev2)</td><td>SCRFD + <b>MobileFaceNet</b> (buffalo_s), 512-d, CPU</td><td><span class="mid">swap the head</span></td></tr>
+    <tr><td>4 &middot; Search</td><td>FAISS, sub-ms at gallery scale</td><td>numpy cosine matmul over the 512-d index</td><td><span class="ok">fine to ~50k</span></td></tr>
+    <tr><td>5 &middot; Temporal</td><td>ByteTrack; embed on new tracks, not every frame</td><td>one embed per crossing of the scan line</td><td><span class="mid">build</span></td></tr>
+    <tr><td>6 &middot; Pixels</td><td>10&ndash;30&times; optical; &ge;80 px before ArcFace</td><td>fixed ground camera; measured px shown live above</td><td><span class="mid">needs optics</span></td></tr>
+    <tr><td>7 &middot; Runtime</td><td>TensorRT on Jetson Orin NX</td><td>onnxruntime, CPUExecutionProvider</td><td><span class="mid">needs hardware</span></td></tr>
+  </table>
+  <p class="note">Two of the seven stages are already running on this page and you can watch
+    them work. The rest is the build.</p>
 
   <div class="subhead">01 / What actually works</div>
   <div class="cards">
@@ -1021,26 +1416,33 @@ RTSP/H.265 from gimbal
       <summary>
         <span class="c-num">06</span>
         <span class="c-main">
-          <span class="c-title">Legal &amp; model-licence notes</span>
-          <span class="c-sub">Not optional, and not a lawyer.</span>
+          <span class="c-title">Build constraints</span>
+          <span class="c-sub">Procurement and regulatory gates &mdash; settle these before hardware.</span>
         </span>
         <span class="c-toggle"></span>
       </summary>
       <div class="c-body">
-        <div class="callout warn">
-          <span class="h">Licence</span>
-          <p>InsightFace weights <b>&ne; free for commercial products</b>. The code is MIT; the
-            packs are research-only unless licensed.</p>
-        </div>
-        <div class="callout warn">
-          <span class="h">Regulation</span>
-          <p>Aerial biometric ID is high-risk under the <b>EU AI Act</b>, and in the US is a mix of
-            FAA ops rules plus state biometric laws (e.g. BIPA). Government use has additional
-            Fourth Amendment / policy constraints.</p>
-          <p>Many countries restrict both drone overflight and covert biometrics. Treat this as a
-            <b>research / SAR / consented-security architecture</b>, not a general-purpose crowd
-            scanner.</p>
-        </div>
+        <p>These two decide what the build is allowed to be. Neither is a formality, and both
+          are cheaper to resolve on paper than after the airframe is flying.</p>
+        <table class="wt">
+          <tr><th>Gate</th><th>Constraint</th><th>What it forces</th></tr>
+          <tr><td>Model licence</td>
+            <td>InsightFace code is MIT, but the pretrained packs (buffalo_l, antelopev2) are
+              <b>non-commercial research only</b>.</td>
+            <td>Licence the weights from InsightFace, retrain ArcFace on data you hold rights
+              to, or buy a commercially licensed SDK. Settle which one before ordering the
+              Jetson &mdash; it changes the bill either way.</td></tr>
+          <tr><td>Regulation</td>
+            <td>Aerial biometric ID is high-risk under the <b>EU AI Act</b>. In the US it is FAA
+              ops rules plus state biometric laws (e.g. BIPA), with additional Fourth Amendment
+              and policy constraints for government use.</td>
+            <td>Ship as research / SAR / consented-security. Many countries restrict both
+              drone overflight and covert biometrics, so consent is a design input here rather
+              than paperwork.</td></tr>
+        </table>
+        <p>Because of the second row, this build leads with <b>person detection</b> and keeps
+          identity behind a consented gallery. That is the cheaper path as well as the
+          defensible one &mdash; stage 1 carries most missions on its own.</p>
       </div>
     </details>
   </div>
@@ -1056,7 +1458,7 @@ RTSP/H.265 from gimbal
 </section>
 
 <footer>
-  <span>GrayTech Security &mdash; part of the XMRT DAO ecosystem</span>
+  <span>Gray Tech Security &mdash; part of the XMRT DAO ecosystem</span>
   <span>Style aligned to graytechsolutions.dev</span>
 </footer>
 
@@ -1071,7 +1473,7 @@ let lastEvents = [], paused = false;
 const CS=getComputedStyle(document.documentElement);
 const pv=n=>CS.getPropertyValue(n).trim();
 const C={ink:pv('--ink'),panel:pv('--ink-3'),gold:pv('--gold'),paper:pv('--paper'),
-         mute:pv('--mute'),grn:pv('--grn'),red:pv('--red')};
+         mute:pv('--mute'),grn:pv('--grn'),red:pv('--red'),amb:pv('--amb'),cyan:pv('--cyn')};
 
 const fmtT = t => new Date(t*1000).toLocaleTimeString();
 
@@ -1149,8 +1551,17 @@ function draw(s){
 
     if(p.scanned){
       cx.fillStyle=col; cx.font='bold 15px "Saira Condensed",sans-serif';
-      cx.textAlign='center'; cx.fillText(p.name, x, y-34);
-      if(p.confidence!=null){
+      cx.textAlign='center';
+      // The face width in px sits next to the name because it is the number
+      // that decides whether the name is worth reading.
+      cx.fillText(p.gated ? (p.name+' · gated')
+                          : (p.name+(p.face_px? ' · '+Math.round(p.face_px)+'px':'')),
+                 x, y-34);
+      if(p.gated){
+        cx.font='11px "Space Mono",monospace';
+        cx.fillStyle=C.amb+'D9';
+        cx.fillText(p.gate_reason||'', x, y-20);
+      } else if(p.confidence!=null){
         cx.font='11px "Space Mono",monospace';
         cx.fillStyle=C.paper+'D9';
         cx.fillText(p.confidence.toFixed(3), x, y-20);
@@ -1163,25 +1574,72 @@ function draw(s){
   });
 }
 
+function kpiHtml(items,small){
+  return items.map(([l,v,c])=>
+    '<div class="kpi"><div class="lab">'+l+'</div>'+
+    '<div class="val" style="color:'+(c||'var(--txt)')+';font-size:'+(small?20:26)+'px">'+
+    v+'</div></div>').join('');
+}
+
 function drawKpis(s){
-  const st=s.stats;
-  const items=[
-    ['Present now', s.present.length, ''],
-    ['Entered', st.entered, ''],
-    ['Exited', st.exited, ''],
-    ['Identified', st.identified, 'var(--grn)'],
-    ['Unknown', st.unknown, st.unknown?'var(--amb)':''],
+  const st=s.stats, px=s.pixel||{}, sp=s.person||{}, spec=px.spec||{};
+  // "In frame" is s.in_frame, not s.present.length. present.length counted
+  // people still walking on from off-canvas and people already walking off, so
+  // it read 7 while five stick figures were on the picture.
+  const inFrame=s.in_frame ?? s.present.length;
+
+  // Stage 1 - YOLO. Its own count, independent of everything below it.
+  document.getElementById('kpis1').innerHTML = kpiHtml([
+    ['People seen', sp.detections ?? 0, (sp.detections?'var(--cyn)':'')],
+    ['Images checked', sp.frames ?? 0, ''],
+    ['Named', 'none', 'var(--mute-2)'],
+  ],true);
+
+  // Stage 2 - the quality gate.
+  document.getElementById('kpis2').innerHTML = kpiHtml([
+    ['Face size', px.observed_median? Math.round(px.observed_median)+' px':'—', 'var(--gold)'],
+    ['Too small to judge', st.gated||0, (st.gated?'var(--amb)':'')],
+    ['Floor', (spec.detect_px??'—')+' px', ''],
+  ],true);
+
+  // Stage 3 - buffalo, against the enrolled gallery only.
+  const judged=(st.identified||0)+(st.unknown||0);
+  document.getElementById('kpis3').innerHTML = kpiHtml([
+    ['Named', st.identified ?? 0, 'var(--grn)'],
+    ['Not in gallery', st.unknown ?? 0, (st.unknown?'var(--amb)':'')],
+    ['Match rate', judged? ((st.identified/judged)*100).toFixed(1)+'%':'—', ''],
+  ],true);
+
+  // Scene state - not a pipeline stage, just where people are.
+  document.getElementById('kpis').innerHTML = kpiHtml([
+    ['In frame', inFrame, 'var(--gold)'],
+    ['Walked in', st.entered ?? 0, ''],
+    ['Walked out', st.exited ?? 0, ''],
     ['Scan time', (s.scan_ms||0).toFixed(0)+' ms', ''],
-    ['Uptime', Math.floor(s.uptime/60)+'m '+Math.floor(s.uptime%60)+'s', ''],
-  ];
-  document.getElementById('kpis').innerHTML = items.map(([l,v,c])=>
-    `<div class="kpi"><div class="lab">${l}</div><div class="val" style="color:${c||'var(--txt)'}">${v}</div></div>`
-  ).join('');
-  const ident = st.identified + st.unknown;
+    ['Uptime', Math.floor((s.uptime||0)/60)+'m '+Math.floor((s.uptime||0)%60)+'s', ''],
+  ]);
+
+  // The relationship between the three numbers, in words. Deliberately NOT
+  // phrased as "YOLO found N, we named M of them": the two counters have
+  // different denominators. YOLO sums bodies per image, buffalo names one face
+  // per crossing of the scan line, so neither number bounds the other and a
+  // subset reading would be plainly wrong (stage 3 can exceed stage 1).
+  document.getElementById('howline').innerHTML =
+    '<b>These three numbers do not add up, and are not meant to.</b> '+
+    'Stage 1 counts <span class="g">bodies per image</span> &mdash; '+(sp.detections??0)+
+    ' detections over '+(sp.frames??0)+' images &mdash; and it is unreliable on tight '+
+    'headshots, which is why it is the stage you point at a real scene. '+
+    'Stage 3 counts <span class="g">faces per crossing</span>: '+(st.identified??0)+
+    ' named against the enrolled gallery, '+(st.unknown??0)+' not in it. '+
+    'Neither number bounds the other, so a gap between them is not an error. '+
+    'Nothing here identifies anyone who has not been enrolled.';
+
+  const off=(s.tracked ?? s.present.length) - inFrame;
   document.getElementById('scaninfo').innerHTML =
-    `Identified <b>${st.identified}</b> of <b>${ident}</b> scans `+
-    `(${ident?((st.identified/ident)*100).toFixed(1):'0.0'}%) &middot; `+
-    `model ${paused?'<span class="mid">paused</span>':'<span class="ok">running</span>'}`;
+    '<b>'+inFrame+'</b> in frame'+
+    (off>0? ', '+off+' walking on or off':'')+
+    (s.edge? ', '+s.edge+' at the edge':'')+' &middot; '+
+    'model '+(paused?'<span class="mid">paused</span>':'<span class="ok">running</span>');
 }
 
 function drawLog(evs){
@@ -1208,9 +1666,68 @@ es.onopen =()=>{document.getElementById('conn').textContent='live';
                 document.getElementById('conn').className='badge live';};
 es.onerror=()=>{document.getElementById('conn').textContent='reconnecting';
                 document.getElementById('conn').className='badge';};
+function drawStages(s){
+  // Stage 1 - YOLO person-find. Reads a real SCENE (the live camera), which is
+  // the only place it is the right instrument; on the tight headshot crops the
+  // demo walks past it returns almost nothing, and that is a property of the
+  // input, not of the model.
+  const sp=s.person||{}, lv=sp.live||{};
+  const tracks=sp.tracks||[];
+  const ys=[
+    ['Model', sp.available? 'yolov8n':'off', sp.available?'':'var(--amb)'],
+    ['Persons found', sp.detections ?? 0, (sp.detections?'var(--cyn)':'')],
+    ['Frames run', sp.frames ?? 0, ''],
+    ['Live tracks', (lv.ok? (sp.tracks||[]).length : '—'), (tracks.length?'var(--cyn)':'')],
+    ['Latency', lv.ok? Math.round(lv.ms)+' ms' : (sp.frames? '~250 ms':'—'), ''],
+  ];
+  document.getElementById('yoloKpis').innerHTML = ys.map(([l,v,c])=>
+    `<div class="kpi"><div class="lab">${l}</div><div class="val" style="color:${c||'var(--txt)'};font-size:20px">${v}</div></div>`
+  ).join('');
+
+  const trackList = tracks.length
+    ? tracks.map(t=>`<span class="feat spec">#${t.id} &middot; ${t.hits} hit`+
+        `${t.hits===1?'':'s'} &middot; ${Math.round(t.conf*100)}% &middot; `+
+        `${t.box[2]-t.box[0]|0}&times;${t.box[3]-t.box[1]|0}</span>`).join('')
+    : '';
+  document.getElementById('yoloNote').innerHTML =
+    (sp.available? '' : '<b class="mid">Stage 1 not loaded.</b> '+sp.detail+' &mdash; ')+
+    `<b>Counted on its own.</b> ${sp.detections??0} person detection`+
+    `${(sp.detections??0)===1?'':'s'} across ${sp.frames??0} frames, with no gallery, `+
+    `no face model and no match threshold involved. `+
+    (sp.hit_rate!=null? `Hit rate ${Math.round(sp.hit_rate*100)}% on this imagery. `:'')+
+    `Track IDs come from IoU association over consecutive frames &mdash; a track `+
+    `ID is "this box over time", never a face.`+
+    (trackList? `<div class="feats" style="margin-top:10px">${trackList}</div>`
+               : ` <span class="mid">Switch live camera on for continuous tracks</span>`+
+               ` &mdash; the simulated walk is drawn, so there is no scene for the `+
+               `detector to read; it sees the still portrait each visitor carries.`);
+
+  // Stage 2 - the quality gate, and the pixel budget it enforces.
+  const px=s.pixel||{}, spec=px.spec||{};
+  const ps=[
+    ['Detect floor', (spec.detect_px??'—')+' px', ''],
+    ['ID floor', (spec.recognise_px??'—')+' px', ''],
+    ['Robust', (spec.robust_px??'—')+' px', ''],
+    ['Median face', px.observed_median? Math.round(px.observed_median)+' px':'—', 'var(--gold)'],
+    ['Median IOD', px.iod_median? Math.round(px.iod_median)+' px':'—', ''],
+    ['Gated', px.gated_total||0, (px.gated_total?'var(--amb)':'')],
+  ];
+  document.getElementById('pxKpis').innerHTML = ps.map(([l,v,c])=>
+    `<div class="kpi"><div class="lab">${l}</div><div class="val" style="color:${c||'var(--txt)'};font-size:20px">${v}</div></div>`
+  ).join('');
+  document.getElementById('pxNote').innerHTML =
+    `Face width and inter-ocular distance are measured on the crop that actually `+
+    `reached the model, from the detector's own bbox and landmarks. A crop under `+
+    `the <b>${spec.detect_px}px</b> detect floor or under the sharpness floor is `+
+    `<b>refused before matching</b> and logged as <span class="mid">gated</span> `+
+    `&mdash; not as an unknown person, because refusing to judge a face is not the `+
+    `same as failing to recognise one.`;
+}
+
 es.onmessage=(m)=>{
   const d=JSON.parse(m.data);
-  draw(d.state); drawKpis(d.state); drawLog(d.events); drawCalibration(d.state.calibration);
+  draw(d.state); drawKpis(d.state); drawLog(d.events);
+  drawCalibration(d.state.calibration); drawStages(d.state);
 };
 
 function drawCalibration(c){
@@ -1256,6 +1773,162 @@ function drawCalibration(c){
       ' — these enrolled identities have absorbed corrections and are now matched against a refined vector.'
     : '<span style="color:var(--mut)">No adaptive corrections recorded yet. Correcting a misidentification enriches that person\'s profile immediately, without retraining the network.</span>';
 }
+
+// ── Live camera + stage 1 overlay ──────────────────────────────────────────
+// The browser owns the camera, so the viewer picks their own device and the
+// server never has to guess what is plugged in. Nothing here starts on its own:
+// it takes a click, and it stops when you stop it.
+const vid=document.getElementById('vid'), hcv=document.getElementById('hudc'),
+      hx=hcv.getContext('2d'), hud=document.getElementById('hud'),
+      camBtn=document.getElementById('camBtn'), camSel=document.getElementById('camSel'),
+      hudEmpty=document.getElementById('hudEmpty'), hudId=document.getElementById('hudId'),
+      hudTel=document.getElementById('hudTel'), liveNote=document.getElementById('liveNote');
+const SESSION=(crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random());
+let camStream=null, camLoop=null, camBusy=false, camFrames=0;
+
+function hudSize(){
+  hcv.width=hud.clientWidth; hcv.height=hud.clientHeight;
+}
+
+function paintTelemetry(rows){
+  hudTel.innerHTML=rows.map(([k,v])=>`<span>${k}<b>${v}</b></span>`).join('');
+}
+
+async function listCams(){
+  try{
+    const devs=await navigator.mediaDevices.enumerateDevices();
+    const cams=devs.filter(d=>d.kind==='videoinput');
+    if(!cams.length){ camSel.innerHTML='<option>no camera found</option>'; return; }
+    camSel.innerHTML=cams.map((d,i)=>
+      `<option value="${d.deviceId}">${d.label||('Camera '+(i+1))}</option>`).join('');
+    camSel.disabled=false;
+  }catch(e){ camSel.innerHTML='<option>camera list blocked</option>'; }
+}
+
+async function startCam(){
+  camBtn.disabled=true; camBtn.textContent='Starting…';
+  try{
+    // Ask for the camera only after the click, and prefer the device the viewer
+    // actually selected. A front-facing camera is just another entry here.
+    const sel=camSel.value;
+    const constraints={audio:false, video: sel
+      ? {deviceId:{exact:sel}, width:{ideal:1280}, height:{ideal:720}}
+      : {facingMode:'user', width:{ideal:1280}, height:{ideal:720}}};
+    camStream=await navigator.mediaDevices.getUserMedia(constraints);
+    vid.srcObject=camStream;
+    await vid.play();
+    hudEmpty.hidden=true;
+    camBtn.textContent='Stop camera';
+    await listCams();                    // labels are only readable once permitted
+    hudSize();
+    fetch('/api/live/stop?session='+encodeURIComponent(SESSION),{method:'POST'});
+    camLoop=setInterval(pumpFrame, 220);  // ~4.5 Hz: one stage-1 pass per tick
+    liveNote.innerHTML='<b class="ok">Live.</b> Sending frames to stage 1 for '+
+      'person detection and tracking. Detection and boxes only &mdash; nothing '+
+      'is enrolled, no frame is stored, and no name is attached to any track.';
+  }catch(err){
+    camBtn.disabled=false; camBtn.textContent='Start camera';
+    liveNote.innerHTML='<b class="no">Camera unavailable.</b> '+
+      (err&&err.name==='NotAllowedError'
+        ? 'Permission denied. Allow camera access for this site, then try again.'
+        : (err&&err.message? err.message : 'Could not open a camera.'))+
+      ' The rest of the console keeps working without it.';
+  }
+}
+
+function stopCam(){
+  if(camLoop){clearInterval(camLoop);camLoop=null;}
+  if(camStream){camStream.getTracks().forEach(t=>t.stop());camStream=null;}
+  vid.srcObject=null;
+  hx.clearRect(0,0,hcv.width,hcv.height);
+  hudEmpty.hidden=false;
+  hudId.textContent='STANDBY';
+  camFrames=0; camBusy=false;
+  camBtn.disabled=false; camBtn.textContent='Start camera';
+  fetch('/api/live/stop?session='+encodeURIComponent(SESSION),{method:'POST'});
+  liveNote.innerHTML='Camera stopped. Streams are released and the session '+
+    'track IDs are discarded.';
+}
+
+async function pumpFrame(){
+  if(camBusy||!camStream||vid.readyState<2) return;
+  camBusy=true;
+  try{
+    const off=document.createElement('canvas');
+    const W=vid.videoWidth||640, H=vid.videoHeight||480;
+    off.width=Math.min(W,960); off.height=Math.round(off.width*H/W);
+    off.getContext('2d').drawImage(vid,0,0,off.width,off.height);
+    const blob=await new Promise(r=>off.toBlob(r,'image/jpeg',0.72));
+    if(!blob) return;
+    const fd=new FormData(); fd.append('file',blob,'frame.jpg');
+    const r=await fetch('/api/live/frame?session='+encodeURIComponent(SESSION),
+                         {method:'POST',body:fd});
+    if(!r.ok) throw new Error('stage 1 returned '+r.status);
+    const d=await r.json();
+    camFrames++;
+    drawOverlay(d);
+  }catch(e){
+    hudId.textContent='STAGE 1 ERROR';
+    liveNote.innerHTML='<b class="no">Stage 1 error.</b> '+
+      (e&&e.message?e.message:'frame not accepted')+
+      ' &mdash; the overlay is paused, the camera is still yours.';
+  }finally{ camBusy=false; }
+}
+
+function drawOverlay(d){
+  const W=hcv.width, H=hcv.height;
+  hx.clearRect(0,0,W,H);
+  const fr=d.frame||{};
+  // Draw boxes in normalised source coordinates so the overlay lines up with
+  // the video whatever size the frame came in at.
+  const sx=fr.w? W/fr.w : 1, sy=fr.h? H/fr.h : 1;
+  const tracksByBox={};
+  (d.tracks||[]).forEach(t=>{ tracksByBox[t.box.map(Math.round).join(',')]=t; });
+
+  (d.persons||[]).forEach(p=>{
+    const [x1,y1,x2,y2]=p.box;
+    const X=x1*sx, Y=y1*sy, BW=(x2-x1)*sx, BH=(y2-y1)*sy;
+    const key=[x1,y1,x2,y2].map(Math.round).join(',');
+    const tr=tracksByBox[key];
+    const col=tr? C.cyan : C.gold;
+    hx.strokeStyle=col; hx.lineWidth=Math.max(1.5,W/620);
+    hx.strokeRect(X,Y,BW,BH);
+    // corner ticks, so a wide box still reads as a tracked subject
+    hx.lineWidth=Math.max(2,W/460);
+    const t=Math.min(BW,BH)*0.22;
+    [[X,Y,1,1],[X+BW,Y,-1,1],[X,Y+BH,1,-1],[X+BW,Y+BH,-1,-1]].forEach(([px,py,dx,dy])=>{
+      hx.beginPath(); hx.moveTo(px+dx*t,py); hx.lineTo(px,py); hx.lineTo(px,py+dy*t); hx.stroke();
+    });
+    const px=Math.round(p.conf*100)+'%';
+    const lbl=(tr? ('PERSON — TRACK '+tr.id) : 'PERSON — UNTRACKED')+'  '+px+
+              (tr? '  ·  '+tr.hits+' HIT'+(tr.hits===1?'':'S') : '');
+    hx.font='600 '+(W/58|0)+'px "Space Mono",monospace';
+    const tw=hx.measureText(lbl).width, pad=5, fsz=W/58|0;
+    hx.fillStyle='rgba(5,7,6,.78)';
+    hx.fillRect(X,Y-Math.max(fsz,13)-pad*2,X+tw+pad*2,Math.max(fsz,13)+pad*2);
+    hx.fillStyle=col;
+    hx.fillText(lbl,X+pad,Y-pad);
+  });
+
+  const n=(d.persons||[]).length;
+  hudId.textContent = n
+    ? 'PERSON — '+n+' · TRACKS '+(d.track_count||0)
+    : 'SCANNING · NO PERSON';
+  paintTelemetry([
+    ['STAGE 1', d.ok?'YOLOV8N':'—'],
+    ['PERSONS', n],
+    ['TRACKS', d.track_count||0],
+    ['CONF', '≥ '+(d.conf||0.25)],
+    ['LATENCY', Math.round(d.ms||0)+' ms'],
+    ['SOURCE', (fr.w||0)+'×'+(fr.h||0)],
+    ['FRAMES', camFrames],
+  ]);
+}
+
+camBtn.addEventListener('click',()=>{ camStream? stopCam() : startCam(); });
+camSel.addEventListener('change',()=>{ if(camStream){ stopCam(); } });
+window.addEventListener('resize',()=>{ if(camStream) hudSize(); });
+if(navigator.mediaDevices&&navigator.mediaDevices.enumerateDevices) listCams();
 
 async function togglePause(){
   const r=await fetch('/api/pause',{method:'POST'});

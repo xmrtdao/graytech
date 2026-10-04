@@ -69,6 +69,42 @@ IDENTITY_DIR = Path(os.environ.get("FACE_IDENTITY_DIR", "./identities")).resolve
 # roughly 40% of buffalo's compute and nothing here consumes them.
 ALLOWED_MODULES = ["detection", "recognition"]
 
+# ── Pixel budget ─────────────────────────────────────────────────────────────
+# Recognition from range is a pixel problem before it is a model problem: below
+# roughly 20px across the face there is nothing to identify, and a confident
+# cosine score computed off a 14px crop is a wrong answer, not a hard one.
+#
+# These floors are the rig spec, expressed as code so the gate, the dashboard
+# and the build plan cannot disagree. They are measured against the image that
+# actually reached the model, never assumed from the scene.
+PX_DETECT = float(os.environ.get("FACE_PX_DETECT", "20"))        # ~8-12 px IOD
+PX_RECOGNISE = float(os.environ.get("FACE_PX_RECOGNISE", "40"))  # IEC 62676-4: ~40px for ID
+PX_ROBUST = float(os.environ.get("FACE_PX_ROBUST", "80"))        # pose/motion/backlight
+# Laplacian variance floor on the face crop. Below this the crop is motion-
+# blurred or out of focus and the embedding is noise.
+SHARPNESS_MIN = float(os.environ.get("FACE_SHARPNESS_MIN", "40"))
+
+
+def pixel_band(face_px: float) -> str:
+    """Which spec band a measured face width falls in."""
+    if face_px >= PX_ROBUST:
+        return "robust"
+    if face_px >= PX_RECOGNISE:
+        return "identify"
+    if face_px >= PX_DETECT:
+        return "detect"
+    return "reject"
+
+
+def pixel_budget() -> dict:
+    """The spec floors, for the dashboard to display rather than restate."""
+    return {
+        "detect_px": PX_DETECT,
+        "recognise_px": PX_RECOGNISE,
+        "robust_px": PX_ROBUST,
+        "sharpness_min": SHARPNESS_MIN,
+    }
+
 
 class _Face:
     """Holds the loaded model and the identity index. One per process."""
@@ -146,15 +182,46 @@ class _Face:
 
         faces = self.app.get(img)
         out, vecs = [], []
+        ih, iw = img.shape[:2]
         for f in faces:
             vec = np.asarray(f.normed_embedding, dtype=np.float32).reshape(-1)
             if vec.shape[0] != 512:
                 continue
             x1, y1, x2, y2 = [int(v) for v in f.bbox]
+
+            # Pixel-budget telemetry. insightface already hands us the bbox and
+            # the 5-point landmarks, and the first two of those are the eye
+            # corners - so face width and inter-ocular distance are both free.
+            # Measuring them here costs one Laplacian over a small crop and
+            # turns "trust the score" into a checkable claim.
+            face_px = float(max(0, x2 - x1))
+            iod_px = 0.0
+            try:
+                ex1, ey1 = float(f.kps[0][0]), float(f.kps[0][1])
+                ex2, ey2 = float(f.kps[1][0]), float(f.kps[1][1])
+                iod_px = float(np.hypot(ex2 - ex1, ey2 - ey1))
+            except Exception:                                   # noqa: BLE001
+                iod_px = 0.0
+
+            sharpness = 0.0
+            try:
+                pad = int(face_px * 0.15)
+                crop = img[max(0, y1 - pad):min(ih, y2 + pad),
+                           max(0, x1 - pad):min(iw, x2 + pad)]
+                if crop.size:
+                    sharpness = float(cv2.Laplacian(
+                        cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
+            except Exception:                                   # noqa: BLE001
+                sharpness = 0.0
+
             out.append({
                 "bbox": [x1, y1, x2, y2],
                 "det_score": round(float(f.det_score), 4),
                 "landmarks": [[round(float(px), 1), round(float(py), 1)] for px, py in f.kps],
+                "face_px": round(face_px, 1),
+                "iod_px": round(iod_px, 1),
+                "sharpness": round(sharpness, 1),
+                "band": pixel_band(face_px),
             })
             vecs.append(_l2(vec))
         matrix = np.stack(vecs).astype(np.float32) if vecs else np.zeros((0, 512), np.float32)
@@ -252,6 +319,12 @@ class FaceOut(BaseModel):
     bbox: list[int]
     det_score: float
     landmarks: list[list[float]]
+    # Pixel-budget telemetry. Optional so a caller constructing FaceOut by hand
+    # from the old four fields still validates.
+    face_px: Optional[float] = None
+    iod_px: Optional[float] = None
+    sharpness: Optional[float] = None
+    band: Optional[str] = None
 
 
 class DetectResponse(BaseModel):
@@ -284,6 +357,7 @@ def health() -> dict:
         "observations": len(calibrator.samples),
         "ort_intra_op_threads": ORT_INTRA_OP_THREADS,
         "provider": "CPUExecutionProvider",
+        "pixel_budget": pixel_budget(),
     }
 
 
