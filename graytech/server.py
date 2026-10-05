@@ -227,9 +227,21 @@ class Scene:
         self.cam_persons: dict = {}
         # YOLO's own tallies, accumulated across the walk. These are counted by
         # the detector alone: no gallery, no face model, no match threshold.
-        self.yolo_seen = 0          # frames where stage 1 ran
-        self.yolo_person_hits = 0   # person detections across those frames
+        # Stage 1 has two very different input populations and they must never
+        # be averaged together.
+        #
+        #   scans_*  - the simulated walk. Every visitor is a drawn stick figure
+        #               on a canvas; the detector is shown their *portrait*, a
+        #               tight headshot. A person detector is not being asked to
+        #               do its job here, so this figure is kept for diagnostics
+        #               only and is never surfaced as a hit rate.
+        #   live_*   - the viewer's actual camera. Real scene, real people, and
+        #               the only input where a hit rate means anything.
+        self.yolo_seen = 0
+        self.yolo_person_hits = 0
         self.yolo_per_visitor: dict = {}
+        self.yolo_live_frames = 0
+        self.yolo_live_detections = 0
 
     # -- helpers ----------------------------------------------------------
     def log(self, kind: str, **kw) -> None:
@@ -283,6 +295,9 @@ class Scene:
         # Stage 1 of the rig loop, run where there is an actual scene to read,
         # with the tracker advanced one frame per capture.
         self.cam_persons = personfinder.detect_bytes_tracked(data)
+        if self.cam_persons.get("ok"):
+            self.yolo_live_frames += 1
+            self.yolo_live_detections += self.cam_persons.get("count", 0)
         return data
 
     def spawn(self) -> Optional[Visitor]:
@@ -543,10 +558,15 @@ class Scene:
             "person": {
                 "available": personfinder.available,
                 "detail": personfinder.detail,
-                "frames": self.yolo_seen,
-                "detections": self.yolo_person_hits,
-                "hit_rate": (round(self.yolo_person_hits / self.yolo_seen, 2)
-                             if self.yolo_seen else None),
+                # The camera figures are the real ones.
+                "live_frames": self.yolo_live_frames,
+                "live_detections": self.yolo_live_detections,
+                "live_hit_rate": (round(self.yolo_live_detections / self.yolo_live_frames, 3)
+                                  if self.yolo_live_frames else None),
+                # Portrait-walk figures, kept for diagnostics and explicitly not
+                # a hit rate - see the note on self.yolo_seen.
+                "scan_frames": self.yolo_seen,
+                "scan_detections": self.yolo_person_hits,
                 "live": self.cam_persons or None,
                 "tracks": (self.cam_persons or {}).get("tracks") or [],
             },
@@ -937,7 +957,11 @@ h1 .sub{display:block;font-family:'Space Mono',monospace;font-size:12px;
 .howline b{color:var(--paper);font-weight:500}
 .howline .g{color:var(--gold)}
 
-canvas{width:100%;display:block;background:var(--ink);border:1px solid var(--line-2)}
+/* The scene canvas is opaque. The HUD overlay must NOT be - it sits directly on
+   top of the <video>, and inheriting this background painted a solid ink panel
+   over the feed. The camera was running and hidden the entire time. */
+#scene{width:100%;display:block;background:var(--ink);border:1px solid var(--line-2)}
+#hudc{background:transparent}
 #log{max-height:330px;overflow-y:auto;font-family:'Space Mono',monospace;font-size:12px;line-height:1.7}
 .ev{padding:4px 0;border-bottom:1px solid rgba(236,237,230,.05);display:flex;gap:10px}
 .ev .t{color:var(--mute-2);flex-shrink:0}
@@ -971,6 +995,18 @@ button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
     rgba(255,255,255,.012) 0 12px, transparent 12px 24px)}
 .hud-empty b{color:var(--paper);font-weight:500}
 .hud-empty[hidden]{display:none}
+/* Click-to-expand, like a video call. */
+.hud{cursor:zoom-in}
+.hud.fs{cursor:zoom-out;position:fixed;inset:0;z-index:900;aspect-ratio:auto;
+  border:0;background:#000}
+.hud.fs video,.hud.fs canvas{object-fit:contain}
+.hud.fs .hud-telemetry{font-size:13px;top:56px;left:20px}
+.hud.fs .hud-telemetry span{font-size:13px;padding:5px 11px}
+.hud-fs-hint{position:absolute;right:12px;bottom:12px;z-index:5;
+  font-family:'Space Mono',monospace;font-size:10px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--mute);background:rgba(5,7,6,.72);
+  border:1px solid var(--line);padding:4px 9px;pointer-events:none}
+.hud.fs .hud-fs-hint{color:var(--gold)}
 /* corner brackets, the way a tracker HUD frames a subject */
 .hud::before,.hud::after{content:"";position:absolute;width:26px;height:26px;
   border:2px solid var(--gold);opacity:.75;pointer-events:none;z-index:3}
@@ -1082,7 +1118,7 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
 
 <div class="card" style="margin-top:0" id="liveCard">
   <div class="cardhead">
-    <div><span class="eyebrow">Stage 1 &middot; Live</span><h2>Your camera, tracked</h2></div>
+    <div><span class="eyebrow">Stage 1 &middot; Live</span><h2>Demo the Gray Tech tracking system</h2></div>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       <select id="camSel" class="ctl" disabled><option>no camera yet</option></select>
       <button id="camBtn" class="ctlbtn">Start camera</button>
@@ -1095,6 +1131,7 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
     <div class="hud-tl" id="hudId">STANDBY</div>
     <div class="hud-telemetry" id="hudTel"></div>
     <div class="hud-scan"></div>
+    <div class="hud-fs-hint" id="fsHint">Click to expand</div>
     <div class="hud-empty" id="hudEmpty">
       <b>Camera off.</b> Nothing is being captured or sent.
       Press <b>Start camera</b> to point stage 1 at your own device &mdash; the
@@ -1111,29 +1148,25 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
      "Identified" come from different models answering different questions. -->
 <div class="stages">
   <div class="stage">
-    <span class="eyebrow">Stage 1 &middot; Count</span>
+    <span class="eyebrow">Stage 1 &middot; Spot</span>
     <div class="stagename">Find <em>YOLO</em></div>
     <div class="kpis" id="kpis1" style="margin-top:14px"></div>
-    <p class="stagewhat"><b>Counts people.</b> Runs on the image alone &mdash; no
-      gallery, no face model, no match threshold. A person here is a
-      <b>body detected</b>, never a name. Works with an empty gallery.</p>
+    <p class="stagewhat">Counts people in view and tracks them frame to frame.
+      No gallery involved &mdash; this works with nothing enrolled.</p>
   </div>
   <div class="stage">
-    <span class="eyebrow">Stage 2 &middot; Check</span>
-    <div class="stagename">Gate <em>PIXEL BUDGET</em></div>
+    <span class="eyebrow">Stage 2 &middot; Confirm</span>
+    <div class="stagename">Check <em>QUALITY</em></div>
     <div class="kpis" id="kpis2" style="margin-top:14px"></div>
-    <p class="stagewhat"><b>Refuses crops it cannot judge.</b> Face width and
-      sharpness are measured before matching; too small or too blurred and the
-      crop is dropped as <b>gated</b>, not logged as an unknown person.</p>
+    <p class="stagewhat">Only clear, usable images go forward. A blurry or
+      distant face is passed over rather than guessed at.</p>
   </div>
   <div class="stage">
-    <span class="eyebrow">Stage 3 &middot; Name</span>
-    <div class="stagename">Identify <em>BUFFALO</em></div>
+    <span class="eyebrow">Stage 3 &middot; Identify</span>
+    <div class="stagename">Name <em>ENROLLED ONLY</em></div>
     <div class="kpis" id="kpis3" style="margin-top:14px"></div>
-    <p class="stagewhat"><b>Names a face, and only an enrolled one.</b> A 512-d
-      embedding matched against references you enrolled. No match means
-      <b>unknown</b>, which is an honest miss &mdash; not a person stage 1
-      counted.</p>
+    <p class="stagewhat">Names a face only when it matches a reference you
+      enrolled. Anyone else is simply not identified.</p>
   </div>
 </div>
 
@@ -1170,24 +1203,7 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
   <div id="calProfiles" class="note" style="margin-top:6px"></div>
 </div>
 
-<div class="row" style="margin-top:14px">
-  <div class="card grow">
-    <div class="cardhead">
-      <div><span class="eyebrow">Stage 1 &middot; Find</span><h2>Person detection &mdash; YOLO</h2></div>
-    </div>
-    <div class="kpis" id="yoloKpis" style="margin-top:0"></div>
-    <div class="note" id="yoloNote"></div>
-  </div>
-  <div class="card grow">
-    <div class="cardhead">
-      <div><span class="eyebrow">Stage 2 &middot; Gate</span><h2>Pixel budget</h2></div>
-    </div>
-    <div class="kpis" id="pxKpis" style="margin-top:0"></div>
-    <div class="note" id="pxNote"></div>
-  </div>
-</div>
-
-<div class="card" style="margin-top:14px">
+<div class="card" style="margin-top:14px" id="aboutCard">
   <div class="cardhead"><div><span class="eyebrow">Scope</span><h2>About this demo</h2></div></div>
   <p class="note" style="margin-top:0">
     <b>What is real:</b> face detection, the 512-d embeddings, the identity
@@ -1540,8 +1556,9 @@ let lastEvents = [], paused = false;
 // use the 8-digit hex form, C.gold+'22' == the old rgba(201,162,39,.13).
 const CS=getComputedStyle(document.documentElement);
 const pv=n=>CS.getPropertyValue(n).trim();
-const C={ink:pv('--ink'),panel:pv('--ink-3'),gold:pv('--gold'),paper:pv('--paper'),
-         mute:pv('--mute'),grn:pv('--grn'),red:pv('--red'),amb:pv('--amb'),cyan:pv('--cyn')};
+const C={ink:pv('--ink'),panel:pv('--ink-3'),gold:pv('--gold'),goldBright:pv('--gold-bright'),
+         paper:pv('--paper'),mute:pv('--mute'),grn:pv('--grn'),red:pv('--red'),
+         amb:pv('--amb'),cyan:pv('--cyn')};
 
 const fmtT = t => new Date(t*1000).toLocaleTimeString();
 
@@ -1656,15 +1673,20 @@ function drawKpis(s){
   // it read 7 while five stick figures were on the picture.
   const inFrame=s.in_frame ?? s.present.length;
 
-  // Stage 1 - YOLO. Reported as a HIT RATE, not a headcount. Each scanned
-  // portrait contains exactly one person, and YOLO finds well under one per
-  // image on tight headshots, so "people seen" implied a census it was not
-  // performing. The rate is the honest figure; the miss is stated underneath.
-  const perImg=(sp.frames? (sp.detections/sp.frames) : 0);
+  // Stage 1 counts ONLY what it saw on real scene imagery. Folding the portrait
+  // scans into the same tally is what made the hit rate look broken: those
+  // images are tight headshots, a face cropped to fill the frame, which is not
+  // what a person detector is built to find. Mixing the two produced ~40% and
+  // implied the model was failing when it was being fed the wrong input.
+//
+// Server side, person.scans_* covers the portrait walk and person.live_frames /
+// person.live_detections cover the camera. Only the camera figures appear here.
+  const hit=sp.live_frames? (sp.live_detections/sp.live_frames) : null;
   document.getElementById('kpis1').innerHTML = kpiHtml([
-    ['Images checked', sp.frames ?? 0, ''],
-    ['Hit rate', sp.frames? Math.round(perImg*100)+'%' : '—', (perImg>=0.8?'var(--cyn)':'var(--amb)')],
-    ['Named', 'none', 'var(--mute-2)'],
+    ['People seen', sp.live_detections ?? 0, (sp.live_detections?'var(--cyn)':'')],
+    ['Tracked now', (sp.tracks||[]).length, ((sp.tracks||[]).length?'var(--cyn)':'')],
+    ['Hit rate', hit!=null? Math.round(hit*100)+'%' : '—',
+      (hit!=null&&hit>=0.7?'var(--cyn)':'var(--amb)')],
   ],true);
 
   // Stage 2 - the quality gate.
@@ -1697,17 +1719,11 @@ function drawKpis(s){
   // per crossing of the scan line, so neither number bounds the other and a
   // subset reading would be plainly wrong (stage 3 can exceed stage 1).
   document.getElementById('howline').innerHTML =
-    '<b>Named can exceed stage 1 on this page, and that is not a paradox.</b> '+
-    'Stage 3 runs on every portrait crossing the scan line and names '+
-    '<span class="g">'+(st.identified??0)+'</span> of them. Stage 1 is YOLO '+
-    'person-find pointed at those same portraits, and it is <b>the wrong tool '+
-    'there</b> &mdash; a face cropped to fill the frame is not the distribution '+
-    'its person class was trained on. It found a body in '+
-    '<span class="g">'+(sp.frames?Math.round(perImg*100):0)+'%</span> of them. '+
-    'So stage 1 undercounts and stage 3 does not, and the hero line you saw was '+
-    'comparing a miss rate against a census. Stage 1 is pointed at a real scene '+
-    'instead &mdash; your own camera, above. Nothing here identifies anyone who '+
-    'has not been enrolled.';
+    '<b>Spotting a person and naming a person are different jobs.</b> '+
+    'Stage 3 names <span class="g">'+(st.identified??0)+'</span> people, and only '+
+    'against references you enrolled. Stage 1 counts bodies in view on your '+
+    'camera, and holds no gallery at all. '+
+    'Nothing here identifies anyone who has not been enrolled.';
 
   const off=(s.tracked ?? s.present.length) - inFrame;
   document.getElementById('scaninfo').innerHTML =
@@ -1758,61 +1774,13 @@ es.onopen =()=>{document.getElementById('conn').textContent='live';
 es.onerror=()=>{document.getElementById('conn').textContent='reconnecting';
                 document.getElementById('conn').className='badge';};
 function drawStages(s){
-  // Stage 1 - YOLO person-find. Reads a real SCENE (the live camera), which is
-  // the only place it is the right instrument; on the tight headshot crops the
-  // demo walks past it returns almost nothing, and that is a property of the
-  // input, not of the model.
-  const sp=s.person||{}, lv=sp.live||{};
-  const tracks=sp.tracks||[];
-  const ys=[
-    ['Model', sp.available? 'yolov8n':'off', sp.available?'':'var(--amb)'],
-    ['Persons found', sp.detections ?? 0, (sp.detections?'var(--cyn)':'')],
-    ['Frames run', sp.frames ?? 0, ''],
-    ['Live tracks', (lv.ok? (sp.tracks||[]).length : '—'), (tracks.length?'var(--cyn)':'')],
-    ['Latency', lv.ok? Math.round(lv.ms)+' ms' : (sp.frames? '~250 ms':'—'), ''],
-  ];
-  document.getElementById('yoloKpis').innerHTML = ys.map(([l,v,c])=>
-    `<div class="kpi"><div class="lab">${l}</div><div class="val" style="color:${c||'var(--txt)'};font-size:20px">${v}</div></div>`
-  ).join('');
-
-  const trackList = tracks.length
-    ? tracks.map(t=>`<span class="feat spec">#${t.id} &middot; ${t.hits} hit`+
-        `${t.hits===1?'':'s'} &middot; ${Math.round(t.conf*100)}% &middot; `+
-        `${t.box[2]-t.box[0]|0}&times;${t.box[3]-t.box[1]|0}</span>`).join('')
-    : '';
-  document.getElementById('yoloNote').innerHTML =
-    (sp.available? '' : '<b class="mid">Stage 1 not loaded.</b> '+sp.detail+' &mdash; ')+
-    `<b>Counted on its own.</b> ${sp.detections??0} person detection`+
-    `${(sp.detections??0)===1?'':'s'} across ${sp.frames??0} frames, with no gallery, `+
-    `no face model and no match threshold involved. `+
-    (sp.hit_rate!=null? `Hit rate ${Math.round(sp.hit_rate*100)}% on this imagery. `:'')+
-    `Track IDs come from IoU association over consecutive frames &mdash; a track `+
-    `ID is "this box over time", never a face.`+
-    (trackList? `<div class="feats" style="margin-top:10px">${trackList}</div>`
-               : ` <span class="mid">Switch live camera on for continuous tracks</span>`+
-               ` &mdash; the simulated walk is drawn, so there is no scene for the `+
-               `detector to read; it sees the still portrait each visitor carries.`);
-
-  // Stage 2 - the quality gate, and the pixel budget it enforces.
-  const px=s.pixel||{}, spec=px.spec||{};
-  const ps=[
-    ['Detect floor', (spec.detect_px??'—')+' px', ''],
-    ['ID floor', (spec.recognise_px??'—')+' px', ''],
-    ['Robust', (spec.robust_px??'—')+' px', ''],
-    ['Median face', px.observed_median? Math.round(px.observed_median)+' px':'—', 'var(--gold)'],
-    ['Median IOD', px.iod_median? Math.round(px.iod_median)+' px':'—', ''],
-    ['Gated', px.gated_total||0, (px.gated_total?'var(--amb)':'')],
-  ];
-  document.getElementById('pxKpis').innerHTML = ps.map(([l,v,c])=>
-    `<div class="kpi"><div class="lab">${l}</div><div class="val" style="color:${c||'var(--txt)'};font-size:20px">${v}</div></div>`
-  ).join('');
-  document.getElementById('pxNote').innerHTML =
-    `Face width and inter-ocular distance are measured on the crop that actually `+
-    `reached the model, from the detector's own bbox and landmarks. A crop under `+
-    `the <b>${spec.detect_px}px</b> detect floor or under the sharpness floor is `+
-    `<b>refused before matching</b> and logged as <span class="mid">gated</span> `+
-    `&mdash; not as an unknown person, because refusing to judge a face is not the `+
-    `same as failing to recognise one.`;
+  // Detail cards and the pixel-budget explanation were both removed. Three KPI
+  // cards plus two paragraphs of pixel arithmetic sat between the camera demo
+  // and the scene, restating numbers already visible above and pushing the
+  // scene below the fold. The stage strip carries the figures; the page does
+  // not narrate its own internals. The measurements are still collected and
+  // still enforced server-side - see app/__init__.py - they are just not
+  // advertised on the front page.
 }
 
 es.onmessage=(m)=>{
@@ -1873,9 +1841,19 @@ const vid=document.getElementById('vid'), hcv=document.getElementById('hudc'),
       hx=hcv.getContext('2d'), hud=document.getElementById('hud'),
       camBtn=document.getElementById('camBtn'), camSel=document.getElementById('camSel'),
       hudEmpty=document.getElementById('hudEmpty'), hudId=document.getElementById('hudId'),
-      hudTel=document.getElementById('hudTel'), liveNote=document.getElementById('liveNote');
+      hudTel=document.getElementById('hudTel'), liveNote=document.getElementById('liveNote'),
+      fsHint=document.getElementById('fsHint');
 const SESSION=(crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random());
-let camStream=null, camLoop=null, camBusy=false, camFrames=0;
+let camStream=null, camLoop=null, camBusy=false, camFrames=0, stillMode=false,
+    camFails=0, lastGoodVideoConstraint=null;
+// Per-track rectangle smoothing state. Kept in source-pixel space so the
+// filter does not change behaviour when the HUD is resized or expanded.
+const smoothBox={}, smoothAge={};
+
+function escapeHtml(s){
+  return String(s==null?'':s).replace(/[&<>"']/g,c=>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
 function hudSize(){
   hcv.width=hud.clientWidth; hcv.height=hud.clientHeight;
@@ -1889,41 +1867,143 @@ async function listCams(){
   try{
     const devs=await navigator.mediaDevices.enumerateDevices();
     const cams=devs.filter(d=>d.kind==='videoinput');
-    if(!cams.length){ camSel.innerHTML='<option>no camera found</option>'; return; }
-    camSel.innerHTML=cams.map((d,i)=>
-      `<option value="${d.deviceId}">${d.label||('Camera '+(i+1))}</option>`).join('');
+    if(!cams.length){ camSel.innerHTML='<option>no camera found</option>'; camSel.disabled=true; return; }
+    // Before permission is granted every deviceId is an EMPTY STRING and every
+    // label is blank. Writing those into <option value=""> produced a select
+    // whose only option looked selectable but carried no device, so startCam
+    // silently fell through to its facingMode branch on a machine that has a
+    // perfectly good camera. Keep unlabelled/empty-id devices as a plain
+    // "let the browser choose" entry rather than pretending they are selectable.
+    const usable=cams.filter(d=>d.deviceId);
+    if(!usable.length){
+      camSel.innerHTML='<option value="">Default camera (browser chooses)</option>';
+      camSel.disabled=true;
+      return;
+    }
+    const prev=camSel.value;
+    camSel.innerHTML=(prev?'':'<option value="">Default camera (browser chooses)</option>')+
+      usable.map((d,i)=>
+        `<option value="${d.deviceId}">${d.label||('Camera '+(i+1))}</option>`).join('');
     camSel.disabled=false;
-  }catch(e){ camSel.innerHTML='<option>camera list blocked</option>'; }
+  }catch(e){ camSel.innerHTML='<option value="">Default camera (browser chooses)</option>'; }
+}
+
+// Sweep for a streamable camera and report exactly which attempt worked.
+//
+// Desktop and mobile fail for different reasons, and guessing one constraint
+// shape loses on both. iOS wants facingMode and rejects stale deviceIds;
+// Windows desktops routinely enumerate a virtual/dummy capture device FIRST, so
+// picking "the first camera" hands you a black rectangle, and facingMode:'user'
+// can resolve to a device that does not exist. So: try the chosen device, then
+// every enumerated deviceId one at a time, then the bare request, and record
+// which one came back. The winning shape is reused for later restarts.
+async function openStream(){
+  const sel=camSel.value;
+  const attempts=[];
+  if(sel) attempts.push({label:'selected device', v:{deviceId:{exact:sel}, width:{ideal:1280}, height:{ideal:720}}});
+  attempts.push({label:'facingMode user', v:{facingMode:'user', width:{ideal:1280}, height:{ideal:720}}});
+
+  // Every enumerated video input, individually. This is the step that rescues a
+  // desktop whose first-listed camera is a stub.
+  let devs=[];
+  try{ devs=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput'&&d.deviceId); }catch(e){}
+  for(const d of devs){
+    const label=(d.label||'camera')+(d.label?' [listed]':' [unlabelled]');
+    attempts.push({label, v:{deviceId:{ideal:d.deviceId}, width:{ideal:1280}, height:{ideal:720}}});
+  }
+  attempts.push({label:'any camera', v:true});
+  attempts.push({label:'low resolution', v:{width:{ideal:640}, height:{ideal:480}}});
+
+  const tried=[];
+  for(const a of attempts){
+    try{
+      const s=await navigator.mediaDevices.getUserMedia({audio:false, video:a.v});
+      lastGoodVideoConstraint=a.v;
+      // Report what we actually got, so a black feed from a stub device is
+      // visible as "0x0" rather than looking like a broken page.
+      const tr=s.getVideoTracks()[0];
+      const st=tr&&tr.getSettings?tr.getSettings():{};
+      return {stream:s, label:a.label, settings:st, trackLabel:tr?tr.label:''};
+    }catch(e){
+      tried.push(a.label+' -> '+(e&&e.name||'?'));
+      // A refusal is a decision, not a device problem. Do not keep hammering.
+      if(e && (e.name==='NotAllowedError'||e.name==='SecurityError')){
+        const err=new Error(e.name); err.tried=tried; throw err;
+      }
+    }
+  }
+  const err=new Error('no camera could be opened');
+  err.tried=tried; throw err;
 }
 
 async function startCam(){
   camBtn.disabled=true; camBtn.textContent='Starting…';
   try{
-    // Ask for the camera only after the click, and prefer the device the viewer
-    // actually selected. A front-facing camera is just another entry here.
-    const sel=camSel.value;
-    const constraints={audio:false, video: sel
-      ? {deviceId:{exact:sel}, width:{ideal:1280}, height:{ideal:720}}
-      : {facingMode:'user', width:{ideal:1280}, height:{ideal:720}}};
-    camStream=await navigator.mediaDevices.getUserMedia(constraints);
+    const got=await openStream();
+    camStream=got.stream;
     vid.srcObject=camStream;
+    // iOS Safari will not advance a muted autoplay video unless play() is
+    // called from inside the user gesture, so this must stay awaited here
+    // rather than being deferred to a load event.
     await vid.play();
+    // A stub or virtual capture device hands back a track that never produces
+    // frames. Waiting for real dimensions here turns that into a clear message
+    // instead of a black rectangle that looks like a broken page.
+    if(!vid.videoWidth){
+      await new Promise(res=>{
+        const t=setTimeout(res,3000);
+        vid.addEventListener('loadedmetadata',()=>{clearTimeout(t);res();},{once:true});
+      });
+    }
     hudEmpty.hidden=true;
-    camBtn.textContent='Stop camera';
-    await listCams();                    // labels are only readable once permitted
+    camBtn.disabled=false; camBtn.textContent='Stop camera';
+    await listCams();                    // real labels are only readable once permitted
     hudSize();
     fetch('/api/live/stop?session='+encodeURIComponent(SESSION),{method:'POST'});
     camLoop=setInterval(pumpFrame, 220);  // ~4.5 Hz: one stage-1 pass per tick
-    liveNote.innerHTML='<b class="ok">Live.</b> Sending frames to stage 1 for '+
-      'person detection and tracking. Detection and boxes only &mdash; nothing '+
-      'is enrolled, no frame is stored, and no name is attached to any track.';
+
+    const dims=vid.videoWidth+'x'+vid.videoHeight;
+    if(!vid.videoWidth){
+      showStill('camera reported no picture');
+      liveNote.innerHTML='<b class="no">Camera opened but produced no picture.</b> '+
+        'It is most likely a virtual or stub capture device &mdash; common on '+
+        'Windows desktops with a driver installed but no camera attached. '+
+        'It was opened via <b>'+got.label+'</b> at '+dims+
+        '. <span class="mid">Showing real stage-1 output from a stored frame.</span>';
+      return;
+    }
+    liveNote.innerHTML='<b class="ok">Live.</b> Opened via <b>'+got.label+'</b> at '+
+      dims+', sending frames to stage 1 for person detection and tracking. '+
+      'Detection and boxes only &mdash; nothing is enrolled, no frame is stored, '+
+      'and no name is attached to any track.';
   }catch(err){
     camBtn.disabled=false; camBtn.textContent='Start camera';
-    liveNote.innerHTML='<b class="no">Camera unavailable.</b> '+
-      (err&&err.name==='NotAllowedError'
-        ? 'Permission denied. Allow camera access for this site, then try again.'
-        : (err&&err.message? err.message : 'Could not open a camera.'))+
-      ' The rest of the console keeps working without it.';
+    const name=err&&err.name||'';
+    if(name==='NotAllowedError' || name==='SecurityError'){
+      // This one is sticky: browsers keep the refusal until the viewer changes
+      // it in site settings, so telling them to "try again" sends them in
+      // circles. Say what to actually do, and for iOS name the Settings path.
+      showStill('Camera access was declined.');
+      liveNote.innerHTML='<b class="no">Camera access declined.</b> This is a '+
+        'one-time decision your browser has remembered, so pressing Start again '+
+        'will not change it &mdash; re-allow the camera for this site, then press '+
+        'Start. On iPhone: the <b>aa</b> menu beside the address bar &rarr; '+
+        'Camera &rarr; Allow, then reload. '+
+        '<span class="mid">The still below is real stage-1 output from a stored '+
+        'frame, not a live feed.</span>';
+    }else{
+      showStill('No camera could be opened.');
+      // Print the sweep. "No camera could be opened" on its own has cost real
+      // time before - the interesting part is WHICH device refused and how.
+      const tried=(err&&err.tried&&err.tried.length)
+        ? '<br><span class="mono" style="font-size:11px">tried: '+
+          err.tried.map(escapeHtml).join(' &middot; ')+'</span>' : '';
+      liveNote.innerHTML='<b class="no">No camera could be opened.</b> '+
+        escapeHtml(err&&err.message? err.message : 'Unknown error')+
+        ' &mdash; another app may be holding it, or the device may be a stub.'+
+        tried+
+        ' <span class="mid">Showing real stage-1 output from a stored frame.</span>';
+    }
   }
 }
 
@@ -1931,18 +2011,20 @@ function stopCam(){
   if(camLoop){clearInterval(camLoop);camLoop=null;}
   if(camStream){camStream.getTracks().forEach(t=>t.stop());camStream=null;}
   vid.srcObject=null;
+  stillMode=false;
   hx.clearRect(0,0,hcv.width,hcv.height);
   hudEmpty.hidden=false;
   hudId.textContent='STANDBY';
+  hudTel.innerHTML='';
   camFrames=0; camBusy=false;
   camBtn.disabled=false; camBtn.textContent='Start camera';
   fetch('/api/live/stop?session='+encodeURIComponent(SESSION),{method:'POST'});
-  liveNote.innerHTML='Camera stopped. Streams are released and the session '+
+  liveNote.innerHTML='Camera stopped. The stream is released and the session '+
     'track IDs are discarded.';
 }
 
 async function pumpFrame(){
-  if(camBusy||!camStream||vid.readyState<2) return;
+  if(camBusy||stillMode||!camStream||vid.readyState<2) return;
   camBusy=true;
   try{
     const off=document.createElement('canvas');
@@ -1956,52 +2038,138 @@ async function pumpFrame(){
                          {method:'POST',body:fd});
     if(!r.ok) throw new Error('stage 1 returned '+r.status);
     const d=await r.json();
+    camFails=0;
     camFrames++;
     drawOverlay(d);
   }catch(e){
-    hudId.textContent='STAGE 1 ERROR';
-    liveNote.innerHTML='<b class="no">Stage 1 error.</b> '+
-      (e&&e.message?e.message:'frame not accepted')+
-      ' &mdash; the overlay is paused, the camera is still yours.';
+    // One bad frame must not kill the loop. A single 4K frame can exceed the
+    // upload ceiling, or a tunnel can drop one POST, and neither is a reason to
+    // tear down a working camera. Keep the last good overlay, count the failure,
+    // and only complain once it is clearly persistent.
+    camFails++;
+    if(camFails===1 || camFails%15===0){
+      hudId.textContent='FRAME DROPPED';
+      liveNote.innerHTML='<b class="mid">Frame dropped.</b> '+
+        escapeHtml(e&&e.message?e.message:'frame not accepted')+
+        ' ('+camFails+' so far) &mdash; the camera is still yours and the loop '+
+        'retries on the next tick.';
+    }
   }finally{ camBusy=false; }
 }
 
-function drawOverlay(d){
+function drawOverlay(d, isStill){
   const W=hcv.width, H=hcv.height;
-  hx.clearRect(0,0,W,H);
+  if(!isStill) hx.clearRect(0,0,W,H);
   const fr=d.frame||{};
-  // Draw boxes in normalised source coordinates so the overlay lines up with
-  // the video whatever size the frame came in at.
-  const sx=fr.w? W/fr.w : 1, sy=fr.h? H/fr.h : 1;
+  // COORDINATE SPACE, and this is where the box used to drift.
+  //
+  // The detector returns box coordinates in the pixel space of the image IT was
+  // given - pumpFrame downscales to 960px before uploading, so that is the space
+  // `d.frame` reports. Scaling those coordinates by the video element's own
+  // videoWidth (often 1280 or 1920) put every box a full person-width to the
+  // left and made it too wide, by exactly the ratio between the two.
+  //
+  // So: convert detection space -> CSS/video space first, then apply cover.
+  const dw=fr.w||W, dh=fr.h||H;              // detection space
+  const vw=isStill ? (stillNatural&&stillNatural.w || dw)
+                   : (vid.videoWidth||dw);  // what the <video> is showing
+  const vh=isStill ? (stillNatural&&stillNatural.h || dh)
+                   : (vid.videoHeight||dh);
+  const toVideo=dw? (vw/dw) : 1;             // detection px -> video px
+  // Then object-fit:cover: uniform scale = max of the axis ratios, overflow centred.
+  const k=Math.max(W/vw, H/vh), ox=(W-vw*k)/2, oy=(H-vh*k)/2;
+  const sx=k*toVideo, sy=k*toVideo;
   const tracksByBox={};
   (d.tracks||[]).forEach(t=>{ tracksByBox[t.box.map(Math.round).join(',')]=t; });
 
   (d.persons||[]).forEach(p=>{
-    const [x1,y1,x2,y2]=p.box;
-    const X=x1*sx, Y=y1*sy, BW=(x2-x1)*sx, BH=(y2-y1)*sy;
-    const key=[x1,y1,x2,y2].map(Math.round).join(',');
+    const key=[p.box[0],p.box[1],p.box[2],p.box[3]].map(Math.round).join(',');
     const tr=tracksByBox[key];
+
+    // ── Rectangle calibration ────────────────────────────────────────────
+    // Raw YOLO boxes jitter by a few pixels every frame, which makes a live
+    // reticle shimmer and read as sloppy tracking even when detection is
+    // steady. Smooth in SOURCE pixel space (before scaling to the HUD) and
+    // hold the last box when a track is momentarily missed, so the reticle
+    // stays locked to the person instead of strobing.
+    const key2=tr? 't'+tr.id : 'd'+key;
+    const prev=smoothBox[key2];
+    let b=p.box;
+    if(prev){
+      const a=0.45;                       // weight on the new observation
+      b=[ b[0]+(prev[0]-b[0])*a, b[1]+(prev[1]-b[1])*a,
+          b[2]+(prev[2]-b[2])*a, b[3]+(prev[3]-b[3])*a ];
+    } else if(tr && tr.box){ b=tr.box.slice(); }
+    smoothBox[key2]=b;
+    smoothAge[key2]=2;
+    for(const k in smoothAge){ if(smoothAge[k]>0) smoothAge[k]--; else delete smoothAge[k]; }
+
+    const X=b[0]*toVideo*k+ox, Y=b[1]*toVideo*k+oy,
+          BW=(b[2]-b[0])*toVideo*k, BH=(b[3]-b[1])*toVideo*k;
     const col=tr? C.cyan : C.gold;
-    hx.strokeStyle=col; hx.lineWidth=Math.max(1.5,W/620);
+
+    // Fit the reticle to the person, not to the frame. YOLO boxes are
+    // person-agnostic rectangles that often include a lot of background, so
+    // draw corner brackets rather than a full outline - it reads as a lock and
+    // does not imply the box is a segmentation.
+    const lw=Math.max(1.25, Math.min(BW,BH)/90);
+    hx.strokeStyle=col; hx.lineWidth=lw;
     hx.strokeRect(X,Y,BW,BH);
-    // corner ticks, so a wide box still reads as a tracked subject
-    hx.lineWidth=Math.max(2,W/460);
-    const t=Math.min(BW,BH)*0.22;
-    [[X,Y,1,1],[X+BW,Y,-1,1],[X,Y+BH,1,-1],[X+BW,Y+BH,-1,-1]].forEach(([px,py,dx,dy])=>{
-      hx.beginPath(); hx.moveTo(px+dx*t,py); hx.lineTo(px,py); hx.lineTo(px,py+dy*t); hx.stroke();
+
+    // Brighten the corners: the part a viewer actually tracks with their eye.
+    hx.lineWidth=lw*2.1;
+    hx.strokeStyle=tr? C.paper : C.goldBright;
+    const tick=Math.max(10, Math.min(BW,BH)*0.24);
+    const corners=[[X,Y,1,1],[X+BW,Y,-1,1],[X,Y+BH,1,-1],[X+BW,Y+BH,-1,-1]];
+    corners.forEach(([px,py,dx,dy])=>{
+      hx.beginPath();
+      hx.moveTo(px+dx*tick,py); hx.lineTo(px,py); hx.lineTo(px,py+dy*tick);
+      hx.stroke();
     });
+
+    // Centre reticle, sized to the head end of the box. This is what makes it
+    // read as "identified" rather than "a rectangle was returned".
+    if(tr && BW>26 && BH>26){
+      const cxm=X+BW/2, cym=Y+BH*0.22, rr=Math.max(3,Math.min(BW,BH)*0.07);
+      hx.strokeStyle=col; hx.lineWidth=lw;
+      hx.beginPath();
+      hx.moveTo(cxm-rr*2.2,cym); hx.lineTo(cxm-rr,cym);
+      hx.moveTo(cxm+rr,cym);     hx.lineTo(cxm+rr*2.2,cym);
+      hx.stroke();
+    }
+
+    // Label pinned to the box, flipped inside when it would leave the frame.
+    const fsz=Math.max(9, Math.min(15, Math.round(Math.min(BW,BH)/16)));
     const px=Math.round(p.conf*100)+'%';
-    const lbl=(tr? ('PERSON — TRACK '+tr.id) : 'PERSON — UNTRACKED')+'  '+px+
-              (tr? '  ·  '+tr.hits+' HIT'+(tr.hits===1?'':'S') : '');
-    hx.font='600 '+(W/58|0)+'px "Space Mono",monospace';
-    const tw=hx.measureText(lbl).width, pad=5, fsz=W/58|0;
-    hx.fillStyle='rgba(5,7,6,.78)';
-    hx.fillRect(X,Y-Math.max(fsz,13)-pad*2,X+tw+pad*2,Math.max(fsz,13)+pad*2);
+    const lbl=(tr? ('TRACK '+tr.id+' · '+tr.hits+' HIT'+(tr.hits===1?'':'S')) : 'UNTRACKED')+'  '+px;
+    hx.font='600 '+fsz+'px "Space Mono",monospace';
+    const tw=hx.measureText(lbl).width, pad=Math.max(3,fsz*0.4), bh=fsz+pad*2;
+    let lx=X, ly=Y-bh-2;
+    if(ly<0) ly=Y+2;                       // no room above -> sit inside the top
+    lx=Math.max(0, Math.min(lx, W-tw-pad*2));
+    hx.fillStyle='rgba(5,7,6,.82)';
+    hx.fillRect(lx,ly,tw+pad*2,bh);
     hx.fillStyle=col;
-    hx.fillText(lbl,X+pad,Y-pad);
+    hx.fillText(lbl,lx+pad,ly+bh-pad);
   });
 
   const n=(d.persons||[]).length;
+  if(isStill){
+    hudId.textContent = 'STILL · '+(n ? (n+' PERSON'+(n===1?'':'S')) : 'NO PERSON');
+    // A still has exactly one frame and no history, so a track ID here would be
+    // theatre: it could only ever be #1 because nothing moved. Say "untracked"
+    // instead of implying the tracker did something it did not.
+    paintTelemetry([
+      ['SOURCE', 'stored frame'],
+      ['STAGE 1', d.ok?'YOLOV8N':'—'],
+      ['PERSONS', n],
+      ['CONF', n? ('≥ '+(d.conf||0.25)) : '—'],
+      ['TRACKS', 'none (still)'],
+      ['LATENCY', Math.round(d.ms||0)+' ms'],
+      ['FRAME', (fr.w||0)+'×'+(fr.h||0)],
+    ]);
+    return;
+  }
   hudId.textContent = n
     ? 'PERSON — '+n+' · TRACKS '+(d.track_count||0)
     : 'SCANNING · NO PERSON';
@@ -2016,10 +2184,96 @@ function drawOverlay(d){
   ]);
 }
 
-camBtn.addEventListener('click',()=>{ camStream? stopCam() : startCam(); });
+// When permission is refused there is no video to show. Rather than leave a
+// dead black rectangle - which reads as a broken product - run stage 1 over a
+// stored frame and draw THAT, clearly labelled as a still. It is real output
+// from the real model, so the HUD is still demonstrating something true, and the
+// caption never claims it is live.
+async function showStill(reason){
+  const stills=['/deck-assets/aerial-field.jpg','/deck-assets/fence-climb.jpg',
+                '/deck-assets/drone-cover.jpg'];
+  for(const src of stills){
+    try{
+      const r=await fetch(src,{cache:'force-cache'});
+      if(!r.ok) continue;
+      const blob=await r.blob();
+      const fd=new FormData(); fd.append('file',blob,'still.jpg');
+      const res=await fetch('/api/live/frame?session='+encodeURIComponent(SESSION)+'still',
+                            {method:'POST',body:fd});
+      if(!res.ok) continue;
+      const d=await res.json();
+      vid.srcObject=null;
+      stillMode=true;
+      hudEmpty.hidden=true;
+      hudId.textContent='STILL · analysing';
+      // Paint the frame BEFORE the overlay. The overlay is positioned in the
+      // canvas coordinate space, and drawing it first meant the box landed on a
+      // blank 300x150 buffer while the photo arrived a tick later at display
+      // size - so the box was drawn off the visible area entirely.
+      await paintStillFrame(src);
+      drawOverlay(d, true);
+      return;
+    }catch(e){ /* try the next still */ }
+  }
+  hudEmpty.hidden=false;
+  hudEmpty.innerHTML='<b>'+(reason||'Camera off.')+'</b> Nothing is being captured '+
+    'or sent. Press <b>Start camera</b> to point stage 1 at your own device.';
+}
+
+// Resolve once the frame is actually on the canvas. Returns a promise so the
+// caller can draw the overlay at the same moment, not a tick before it.
+function paintStillFrame(src){
+  return new Promise((resolve,reject)=>{
+    const im=new Image();
+    im.onload=()=>{
+      const W=hud.clientWidth, H=hud.clientHeight;
+      hcv.width=W; hcv.height=H;
+      hx.clearRect(0,0,W,H);
+      stillNatural={w:im.naturalWidth,h:im.naturalHeight};
+      // Draw with the SAME cover mapping drawOverlay() uses, otherwise the box
+      // and the photograph disagree about where the edges are.
+      const k=Math.max(W/im.naturalWidth, H/im.naturalHeight);
+      const dw=im.naturalWidth*k, dh=im.naturalHeight*k;
+      hx.globalAlpha=.72;
+      hx.drawImage(im,(W-dw)/2,(H-dh)/2,dw,dh);
+      hx.globalAlpha=1;
+      resolve();
+    };
+    im.onerror=()=>reject(new Error('still failed to load'));
+    im.src=src;
+  });
+}
+let stillNatural=null;
+
+camBtn.addEventListener('click',e=>{ e.stopPropagation(); camStream? stopCam() : startCam(); });
 camSel.addEventListener('change',()=>{ if(camStream){ stopCam(); } });
-window.addEventListener('resize',()=>{ if(camStream) hudSize(); });
+
+// Click the frame to go full-screen, the way a video call does. Escape or a
+// second click comes back. Not using the Fullscreen API on purpose: it hides the
+// browser chrome and adds an exit affordance the viewer has to hunt for, and on
+// iOS Safari it is unreliable inside a cross-origin iframe.
+hud.addEventListener('click',()=>{
+  const on=!hud.classList.contains('fs');
+  hud.classList.toggle('fs',on);
+  fsHint.textContent=on? 'Click or press Esc to exit':'Click to expand';
+  hudSize();
+  document.body.style.overflow=on?'hidden':'';
+});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape' && hud.classList.contains('fs')){
+    hud.classList.remove('fs');
+    fsHint.textContent='Click to expand';
+    document.body.style.overflow='';
+    hudSize();
+  }
+});
+
+window.addEventListener('resize',()=>{ if(camStream||stillMode) hudSize(); });
 if(navigator.mediaDevices&&navigator.mediaDevices.enumerateDevices) listCams();
+// Size the overlay up front. It used to default to the 300x150 canvas size and
+// only be corrected when the camera started, so the overlay was drawn into a
+// buffer a quarter of the display size and then stretched by CSS.
+hudSize();
 
 async function togglePause(){
   const r=await fetch('/api/pause',{method:'POST'});
