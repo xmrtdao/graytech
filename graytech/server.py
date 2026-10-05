@@ -935,26 +935,34 @@ h1 .sub{display:block;font-family:'Space Mono',monospace;font-size:12px;
   margin-top:8px;font-variant-numeric:tabular-nums;color:var(--paper)}
 
 /* ---------- the three stages, side by side ---------- */
-.stages{display:grid;grid-template-columns:repeat(3,1fr);gap:0;margin-top:22px;
+/* Three stages, one compact strip. This was three tall cards with a heading,
+   three KPI cells and a paragraph each, which pushed the recognition scene -
+   the thing the page exists to show - entirely below the fold. Collapsed to a
+   single row: stage name on the left, its numbers inline, no prose. */
+.stages{display:grid;grid-template-columns:repeat(3,1fr);gap:0;margin-top:14px;
   border:1px solid var(--line);background:var(--ink-3)}
-@media(max-width:900px){.stages{grid-template-columns:1fr}}
-.stage{padding:18px 20px;border-right:1px solid var(--line)}
+@media(max-width:860px){.stages{grid-template-columns:1fr}}
+.stage{padding:12px 16px;border-right:1px solid var(--line);
+  display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
 .stage:last-child{border-right:0}
-@media(max-width:900px){.stage{border-right:0;border-bottom:1px solid var(--line)}
+@media(max-width:860px){.stage{border-right:0;border-bottom:1px solid var(--line)}
   .stage:last-child{border-bottom:0}}
-.stagename{font-family:'Saira Condensed',sans-serif;font-weight:600;font-size:21px;
-  text-transform:uppercase;letter-spacing:.02em;margin-top:4px;color:var(--paper)}
+.stagename{font-family:'Saira Condensed',sans-serif;font-weight:600;font-size:16px;
+  text-transform:uppercase;letter-spacing:.03em;color:var(--paper);flex:none}
 .stagename em{font-style:normal;color:var(--gold);font-family:'Space Mono',monospace;
-  font-size:10.5px;letter-spacing:.14em;margin-left:9px;vertical-align:middle}
-.stagewhat{color:var(--mute);font-weight:300;font-size:13px;line-height:1.55;margin-top:14px;
-  padding-top:12px;border-top:1px solid var(--line)}
-.stagewhat b{color:var(--paper);font-weight:500}
-.scenebar{display:flex;flex-wrap:wrap;gap:10px 26px;margin-top:14px;padding:12px 2px 0;
+  font-size:9.5px;letter-spacing:.14em;margin-left:7px;vertical-align:middle}
+/* Inline figures instead of nested cards. */
+.stage .kpis{display:flex;gap:16px;margin-top:0;flex-wrap:wrap;flex:1}
+.stage .kpi{padding:0;border:0;background:none;min-width:0}
+.stage .kpi .lab{font-size:9px;letter-spacing:.16em;color:var(--mute-2)}
+.stage .kpi .val{font-family:'Space Mono',monospace;font-size:13px;font-weight:400;
+  margin-top:2px;letter-spacing:.02em}
+.scenebar{display:flex;flex-wrap:wrap;gap:8px 22px;margin-top:10px;padding:10px 2px 0;
   border-top:1px solid var(--line)}
 .scenebar .kpi{padding:0;border:0;background:none}
-.howline{color:var(--mute);font-weight:300;font-size:13.5px;line-height:1.6;margin-top:14px;
+.howline{color:var(--mute-2);font-weight:300;font-size:12px;line-height:1.55;margin-top:10px;
   max-width:900px}
-.howline b{color:var(--paper);font-weight:500}
+.howline b{color:var(--mute);font-weight:400}
 .howline .g{color:var(--gold)}
 
 /* The scene canvas is opaque. The HUD overlay must NOT be - it sits directly on
@@ -962,10 +970,28 @@ h1 .sub{display:block;font-family:'Space Mono',monospace;font-size:12px;
    over the feed. The camera was running and hidden the entire time. */
 #scene{width:100%;display:block;background:var(--ink);border:1px solid var(--line-2)}
 #hudc{background:transparent}
-#log{max-height:330px;overflow-y:auto;font-family:'Space Mono',monospace;font-size:12px;line-height:1.7}
-.ev{padding:4px 0;border-bottom:1px solid rgba(236,237,230,.05);display:flex;gap:10px}
+#log{max-height:340px;overflow-y:auto;font-family:'Space Mono',monospace;
+  font-size:11.5px;line-height:1.6}
+/* Each row is a pipeline step: a coloured rail shows whether this event came
+   from the find stage or the name stage, so a scan arriving reads as
+   "body found -> face checked -> named" as it happens. */
+.ev{position:relative;display:grid;
+  grid-template-columns:3px 58px 54px minmax(70px,auto) 1fr;
+  gap:9px;align-items:baseline;padding:5px 0 5px 0;
+  border-bottom:1px solid rgba(236,237,230,.045)}
+.ev .rail{background:var(--line-2);align-self:stretch;border-radius:2px}
+.ev[data-stage="1"] .rail{background:var(--cyn)}
+.ev[data-stage="2"] .rail{background:var(--gold)}
 .ev .t{color:var(--mute-2);flex-shrink:0}
-.ev .k{width:60px;flex-shrink:0;font-weight:700;letter-spacing:.08em}
+.ev .k{font-weight:700;letter-spacing:.06em;font-size:10px}
+.ev .nm{color:var(--paper);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ev .dt{color:var(--mute);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* New rows slide in and flash their rail, so arrivals are visible without
+   having to read them. */
+.ev.fresh{animation:evin .45s ease-out}
+@keyframes evin{from{opacity:0;transform:translateY(-6px);background:rgba(201,162,39,.10)}
+                to{opacity:1;transform:none;background:transparent}}
+@media(prefers-reduced-motion:reduce){.ev.fresh{animation:none}}
 .k.entry{color:var(--cyn)}.k.exit{color:var(--pur)}
 .k.scan{color:var(--grn)}.k.error{color:var(--red)}
 .ok{color:var(--grn)}.no{color:var(--red)}.mid{color:var(--amb)}
@@ -987,8 +1013,14 @@ button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
 .ctlbtn:hover{background:var(--gold-bright);border-color:var(--gold-bright);color:var(--ink)}
 .hud{position:relative;background:#050706;border:1px solid var(--line-2);
   aspect-ratio:16/9;overflow:hidden}
-.hud video,.hud canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
-.hud video{filter:saturate(.85) contrast(1.05)}
+/* The <video> is the capture SOURCE only; it is not displayed.
+   The canvas paints the frame itself, so the picture and the detection boxes
+   are guaranteed to share one coordinate space. Letting CSS object-fit:cover
+   scale the video while the canvas used its own arithmetic was the source of a
+   persistent leftward drift in the overlay - the two never agreed on where the
+   frame edges were. */
+.hud video{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+.hud canvas{position:absolute;inset:0;width:100%;height:100%}
 .hud-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
   text-align:center;padding:28px;color:var(--mute);font-weight:300;font-size:14px;
   line-height:1.7;background:repeating-linear-gradient(45deg,
@@ -1146,30 +1178,6 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
 <!-- Three stages, in pipeline order, each labelled with what it actually
      measures. A flat row of ten numbers cannot tell you that "Persons" and
      "Identified" come from different models answering different questions. -->
-<div class="stages">
-  <div class="stage">
-    <span class="eyebrow">Stage 1 &middot; Spot</span>
-    <div class="stagename">Find <em>YOLO</em></div>
-    <div class="kpis" id="kpis1" style="margin-top:14px"></div>
-    <p class="stagewhat">Counts people in view and tracks them frame to frame.
-      No gallery involved &mdash; this works with nothing enrolled.</p>
-  </div>
-  <div class="stage">
-    <span class="eyebrow">Stage 2 &middot; Confirm</span>
-    <div class="stagename">Check <em>QUALITY</em></div>
-    <div class="kpis" id="kpis2" style="margin-top:14px"></div>
-    <p class="stagewhat">Only clear, usable images go forward. A blurry or
-      distant face is passed over rather than guessed at.</p>
-  </div>
-  <div class="stage">
-    <span class="eyebrow">Stage 3 &middot; Identify</span>
-    <div class="stagename">Name <em>ENROLLED ONLY</em></div>
-    <div class="kpis" id="kpis3" style="margin-top:14px"></div>
-    <p class="stagewhat">Names a face only when it matches a reference you
-      enrolled. Anyone else is simply not identified.</p>
-  </div>
-</div>
-
 <div class="scenebar kpis" id="kpis"></div>
 <p class="howline" id="howline"></p>
 
@@ -1548,7 +1556,7 @@ RTSP/H.265 from gimbal
 
 <script>
 const cv = document.getElementById('scene'), cx = cv.getContext('2d');
-let lastEvents = [], paused = false;
+let paused = false;
 
 // The 2D canvas cannot read CSS custom properties, so pull the palette out of the
 // stylesheet once instead of hard-coding hex here. That keeps :root the single
@@ -1673,57 +1681,26 @@ function drawKpis(s){
   // it read 7 while five stick figures were on the picture.
   const inFrame=s.in_frame ?? s.present.length;
 
-  // Stage 1 counts ONLY what it saw on real scene imagery. Folding the portrait
-  // scans into the same tally is what made the hit rate look broken: those
-  // images are tight headshots, a face cropped to fill the frame, which is not
-  // what a person detector is built to find. Mixing the two produced ~40% and
-  // implied the model was failing when it was being fed the wrong input.
-//
-// Server side, person.scans_* covers the portrait walk and person.live_frames /
-// person.live_detections cover the camera. Only the camera figures appear here.
-  const hit=sp.live_frames? (sp.live_detections/sp.live_frames) : null;
-  document.getElementById('kpis1').innerHTML = kpiHtml([
-    ['People seen', sp.live_detections ?? 0, (sp.live_detections?'var(--cyn)':'')],
-    ['Tracked now', (sp.tracks||[]).length, ((sp.tracks||[]).length?'var(--cyn)':'')],
-    ['Hit rate', hit!=null? Math.round(hit*100)+'%' : '—',
-      (hit!=null&&hit>=0.7?'var(--cyn)':'var(--amb)')],
-  ],true);
-
-  // Stage 2 - the quality gate.
-  document.getElementById('kpis2').innerHTML = kpiHtml([
-    ['Face size', px.observed_median? Math.round(px.observed_median)+' px':'—', 'var(--gold)'],
-    ['Too small to judge', st.gated||0, (st.gated?'var(--amb)':'')],
-    ['Floor', (spec.detect_px??'—')+' px', ''],
-  ],true);
-
-  // Stage 3 - buffalo, against the enrolled gallery only.
+  // The three stage tiles are gone. The pipeline is demonstrated live in the
+  // camera HUD instead - find, check, name animate in the overlay - so these
+  // numbers are just the running totals for the scene.
   const judged=(st.identified||0)+(st.unknown||0);
-  document.getElementById('kpis3').innerHTML = kpiHtml([
-    ['Named', st.identified ?? 0, 'var(--grn)'],
-    ['Not in gallery', st.unknown ?? 0, (st.unknown?'var(--amb)':'')],
-    ['Match rate', judged? ((st.identified/judged)*100).toFixed(1)+'%':'—', ''],
-  ],true);
-
-  // Scene state - not a pipeline stage, just where people are.
   document.getElementById('kpis').innerHTML = kpiHtml([
     ['In frame', inFrame, 'var(--gold)'],
     ['Walked in', st.entered ?? 0, ''],
     ['Walked out', st.exited ?? 0, ''],
+    ['Named', st.identified ?? 0, 'var(--grn)'],
+    ['Not in gallery', st.unknown ?? 0, (st.unknown?'var(--amb)':'')],
+    ['Match rate', judged? ((st.identified/judged)*100).toFixed(1)+'%':'—', ''],
     ['Scan time', (s.scan_ms||0).toFixed(0)+' ms', ''],
     ['Uptime', Math.floor((s.uptime||0)/60)+'m '+Math.floor((s.uptime||0)%60)+'s', ''],
   ]);
 
-  // The relationship between the three numbers, in words. Deliberately NOT
-  // phrased as "YOLO found N, we named M of them": the two counters have
-  // different denominators. YOLO sums bodies per image, buffalo names one face
-  // per crossing of the scan line, so neither number bounds the other and a
-  // subset reading would be plainly wrong (stage 3 can exceed stage 1).
   document.getElementById('howline').innerHTML =
-    '<b>Spotting a person and naming a person are different jobs.</b> '+
-    'Stage 3 names <span class="g">'+(st.identified??0)+'</span> people, and only '+
-    'against references you enrolled. Stage 1 counts bodies in view on your '+
-    'camera, and holds no gallery at all. '+
-    'Nothing here identifies anyone who has not been enrolled.';
+    'The camera panel runs the whole chain live &mdash; <b>find</b> a person, '+
+    '<b>check</b> the face is usable, then <b>name</b> it against the enrolled '+
+    'gallery. A name only ever comes from a reference you enrolled; anyone else '+
+    'is left unidentified rather than guessed at.';
 
   const off=(s.tracked ?? s.present.length) - inFrame;
   document.getElementById('scaninfo').innerHTML =
@@ -1738,7 +1715,8 @@ function drawKpis(s){
     // Hit rate, not a headcount. YOLO finds well under one person per portrait
     // here, so a "people seen" figure next to "named" implied a census it was
     // not performing and read as a contradiction.
-    ['YOLO hit rate', sp.frames? Math.round(perImg*100)+'%' : '—', (perImg>=0.8?'var(--cyn)':'var(--amb)')],
+    ['YOLO hit rate', sp.live_frames? Math.round((sp.live_detections/sp.live_frames)*100)+'%' : '—',
+      (sp.live_frames && (sp.live_detections/sp.live_frames)>=0.7?'var(--cyn)':'var(--amb)')],
     ['Named', st.identified ?? 0, 'var(--grn)'],
     ['Face size', px.observed_median? Math.round(px.observed_median)+'px':'—', ''],
     ['Scan', (s.scan_ms||0).toFixed(0)+'ms', ''],
@@ -1749,23 +1727,52 @@ function drawKpis(s){
     '<div class="val" style="color:'+(c||'var(--paper)')+'">'+v+'</div></div>').join('');
 }
 
+// The log is the pipeline demo, not a log. Each arrival walks the same path the
+// data actually took -- FIND (a body) then NAME (a face) -- so the three stage
+// tiles above stop being abstract labels and become the thing you can watch.
+const STAGE_OF={entry:1, scan:2, error:2, exit:1, gated:2};
 function drawLog(evs){
   const box=document.getElementById('log');
-  const changed = evs.length!==lastEvents.length ||
-                  (evs.length && evs[evs.length-1].t!==lastEvents[lastEvents.length-1]?.t);
-  if(!changed) return;
-  lastEvents=evs;
-  box.innerHTML = evs.slice(-70).reverse().map(e=>{
+  if(!box) return;
+  const newest=evs.length? evs[evs.length-1].t : 0;
+  if(newest===lastLogT) return;      // no new arrival since the last frame
+  lastLogT=newest;
+  // Everything we have not seen yet, oldest first, so the newest lands last.
+  const fresh=[];
+  for(const e of evs){
+    const sig=e.t+'|'+e.kind+'|'+e.name;
+    if(!seenEvents.has(sig)){ seenEvents.add(sig); fresh.push(e); }
+  }
+  // Keep the seen-set from growing without bound on a long-lived tab.
+  if(seenEvents.size>400){ seenEvents=new Set(fresh.map(e=>e.t+'|'+e.kind+'|'+e.name)); }
+
+  const rowHtml=(e,isNew)=>{
     let detail='';
     if(e.kind==='scan'){
       detail = e.detected
         ? (e.matched? `matched ${e.name} ${e.confidence}` : `no match (best ${e.confidence})`)
         : 'no face detected';
+      if(e.gated||e.reason) detail = e.reason || 'held at the quality gate';
     }
-    return `<div class="ev"><span class="t">${fmtT(e.t)}</span>`+
+    const st=STAGE_OF[e.kind]||1;
+    return `<div class="ev${isNew?' fresh':''}" data-stage="${st}">`+
+           `<span class="rail"></span>`+
+           `<span class="t">${fmtT(e.t)}</span>`+
            `<span class="k ${e.kind}">${e.kind.toUpperCase()}</span>`+
-           `<span>${e.name||''} ${detail}</span></div>`;
-  }).join('');
+           `<span class="nm">${e.name||''}</span>`+
+           `<span class="dt">${detail}</span></div>`;
+  };
+
+  // Prepend the new arrivals so they animate in at the top, newest first.
+  if(fresh.length){
+    const add=fresh.reverse().map(e=>rowHtml(e,true)).join('');
+    box.insertAdjacentHTML('afterbegin', add);
+    const rows=box.querySelectorAll('.ev');
+    for(let i=rows.length-1;i>=0 && i>90;i--) rows[i].remove();
+    requestAnimationFrame(()=>{
+      box.querySelectorAll('.ev.fresh').forEach(r=>r.classList.remove('fresh'));
+    });
+  }
 }
 
 const es=new EventSource('/api/stream');
@@ -1785,9 +1792,31 @@ function drawStages(s){
 
 es.onmessage=(m)=>{
   const d=JSON.parse(m.data);
-  draw(d.state); drawKpis(d.state); drawLog(d.events);
-  drawCalibration(d.state.calibration); drawStages(d.state);
+  // Draw the log FIRST and isolate every panel. These used to run in sequence
+  // inside one handler, so a single undefined variable in any one of them threw
+  // before the rest ran and silently killed the log - which is exactly what
+  // happened: drawKpis referenced an identifier that no longer existed, and the
+  // event log rendered nothing at all while the scene kept streaming. One bad
+  // panel must never be able to take the others down with it.
+  drawLog(d.events);
+  safe('kpis', ()=>drawKpis(d.state));
+  safe('calibration', ()=>drawCalibration(d.state.calibration));
+  safe('scene', ()=>draw(d.state));
+  safe('stages', ()=>drawStages(d.state));
 };
+
+function safe(name, fn){
+  try{ fn(); }
+  catch(e){
+    if(!window.__panelFails) window.__panelFails={};
+    window.__panelFails[name]=(window.__panelFails[name]||0)+1;
+    // Log once per panel, not once per frame - 4 messages a second of the same
+    // stack trace helps nobody and buries anything new.
+    if(window.__panelFails[name]===1){
+      console.error('panel "'+name+'" failed: '+(e&&e.message));
+    }
+  }
+}
 
 function drawCalibration(c){
   if(!c) return;
@@ -1844,11 +1873,27 @@ const vid=document.getElementById('vid'), hcv=document.getElementById('hudc'),
       hudTel=document.getElementById('hudTel'), liveNote=document.getElementById('liveNote'),
       fsHint=document.getElementById('fsHint');
 const SESSION=(crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random());
+// Log rows are keyed by t|kind|name so a repeat of the same event is not
+// re-animated on every SSE frame, and an arrival is only ever added once.
+let seenEvents=new Set(), lastLogT=0;
 let camStream=null, camLoop=null, camBusy=false, camFrames=0, stillMode=false,
     camFails=0, lastGoodVideoConstraint=null;
 // Per-track rectangle smoothing state. Kept in source-pixel space so the
 // filter does not change behaviour when the HUD is resized or expanded.
 const smoothBox={}, smoothAge={};
+
+// One cover-fit routine, used for the live frame AND the still, so the picture
+// and the detection boxes can never disagree about where the frame edges are.
+// Returns the transform so callers can map source pixels with the same numbers.
+function coverDraw(ctx, src, sw, sh, alpha){
+  const W=ctx.canvas.width, H=ctx.canvas.height;
+  const k=Math.max(W/sw, H/sh), dw=sw*k, dh=sh*k;
+  const dx=(W-dw)/2, dy=(H-dh)/2;
+  if(alpha!=null){ ctx.globalAlpha=alpha; }
+  ctx.drawImage(src, dx, dy, dw, dh);
+  if(alpha!=null){ ctx.globalAlpha=1; }
+  return {k, dx, dy};
+}
 
 function escapeHtml(s){
   return String(s==null?'':s).replace(/[&<>"']/g,c=>
@@ -2059,7 +2104,16 @@ async function pumpFrame(){
 
 function drawOverlay(d, isStill){
   const W=hcv.width, H=hcv.height;
-  if(!isStill) hx.clearRect(0,0,W,H);
+  // Paint the frame here, in the same space the boxes are computed in. The
+  // <video> is a hidden capture source only; letting CSS scale it with
+  // object-fit while the canvas used its own arithmetic is what left the boxes
+  // permanently offset from the people they were tracking.
+  if(!isStill){
+    hx.clearRect(0,0,W,H);
+    if(vid.readyState>=2 && vid.videoWidth){
+      coverDraw(hx, vid, vid.videoWidth, vid.videoHeight);
+    }
+  }
   const fr=d.frame||{};
   // COORDINATE SPACE, and this is where the box used to drift.
   //
@@ -2104,8 +2158,17 @@ function drawOverlay(d, isStill){
     smoothAge[key2]=2;
     for(const k in smoothAge){ if(smoothAge[k]>0) smoothAge[k]--; else delete smoothAge[k]; }
 
-    const X=b[0]*toVideo*k+ox, Y=b[1]*toVideo*k+oy,
-          BW=(b[2]-b[0])*toVideo*k, BH=(b[3]-b[1])*toVideo*k;
+    // Clamp to the canvas. YOLO can report a box whose top edge is at or above the
+    // frame boundary, and a rect drawn from a negative y is simply not painted
+    // there - which reads as "the square is missing above the person" even
+    // though the box exists. Clamping keeps the outline closed and still sits it
+    // on the person, because only the off-canvas sliver is trimmed.
+    let X=b[0]*toVideo*k+ox, Y=b[1]*toVideo*k+oy,
+        BW=(b[2]-b[0])*toVideo*k, BH=(b[3]-b[1])*toVideo*k;
+    const cx0=Math.max(0,X), cy0=Math.max(0,Y),
+          cx1=Math.min(W,X+BW), cy1=Math.min(H,Y+BH);
+    if(cx1<=cx0||cy1<=cy0){ return; }          // entirely outside: nothing to draw
+    X=cx0; Y=cy0; BW=cx1-cx0; BH=cy1-cy0;
     const col=tr? C.cyan : C.gold;
 
     // Fit the reticle to the person, not to the frame. YOLO boxes are
@@ -2230,13 +2293,7 @@ function paintStillFrame(src){
       hcv.width=W; hcv.height=H;
       hx.clearRect(0,0,W,H);
       stillNatural={w:im.naturalWidth,h:im.naturalHeight};
-      // Draw with the SAME cover mapping drawOverlay() uses, otherwise the box
-      // and the photograph disagree about where the edges are.
-      const k=Math.max(W/im.naturalWidth, H/im.naturalHeight);
-      const dw=im.naturalWidth*k, dh=im.naturalHeight*k;
-      hx.globalAlpha=.72;
-      hx.drawImage(im,(W-dw)/2,(H-dh)/2,dw,dh);
-      hx.globalAlpha=1;
+      coverDraw(hx, im, im.naturalWidth, im.naturalHeight, .72);
       resolve();
     };
     im.onerror=()=>reject(new Error('still failed to load'));
