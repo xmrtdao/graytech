@@ -828,9 +828,13 @@ UI_HTML = r"""<!DOCTYPE html>
   --bg:var(--ink); --panel:var(--ink-3); --txt:var(--paper); --mut:var(--mute);
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--ink);color:var(--paper);max-width:var(--maxw);margin:0 auto;
-  padding:0 28px 72px;font-family:'Barlow',system-ui,sans-serif;font-weight:400;
+body{background:var(--ink);color:var(--paper);
+  font-family:'Barlow',system-ui,sans-serif;font-weight:400;
   line-height:1.6;-webkit-font-smoothing:antialiased}
+/* Content column. The old body padding + max-width became this wrapper so the
+   background photograph can run full-bleed behind it. */
+.page{max-width:var(--maxw);margin:0 auto;padding:0 28px 72px;
+  position:relative;z-index:1}
 ::selection{background:var(--gold);color:var(--ink)}
 .mono{font-family:'Space Mono',monospace}
 .eyebrow{font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.26em;
@@ -840,23 +844,36 @@ body{background:var(--ink);color:var(--paper);max-width:var(--maxw);margin:0 aut
 header.top{border-bottom:1px solid var(--line);margin:0 -28px 24px;padding:30px 28px 24px;
   background:radial-gradient(120% 90% at 78% 0%, rgba(201,162,39,.10), transparent 55%),var(--ink)}
 
-/* Hero: drone plate behind the wordmark, with a live telemetry strip. The image
-   is decorative and sits behind the text, so it is an empty alt on a CSS
-   background rather than a real <img> the reader has to skip. */
-header.hero{position:relative;overflow:hidden;padding:0;
-  border-bottom:1px solid var(--line);margin:0 -28px 22px}
-.hero-plate{position:absolute;inset:0;background:
-    url('/deck-assets/drone-cover.jpg') center 42%/cover no-repeat;
-  filter:saturate(.8) contrast(1.06)}
+/* The drone plate belongs to the HERO, full-bleed to the viewport edges but
+   only as tall as the hero itself. An earlier attempt hung it on body as a
+   fixed background, which stretched one landscape frame across the entire
+   scrolling document - the aircraft ended up a smear behind the workup tables
+   and the page lost its flat ink surface. Contained to the hero it reads as a
+   photograph again. */
+body{background:var(--ink)}
+
+header.hero{position:relative;overflow:hidden;isolation:isolate;
+  margin:0 -28px 22px;padding:0;border-bottom:1px solid var(--line)}
+.hero-plate{position:absolute;inset:0;z-index:-2;background:
+    url('/deck-assets/drone-cover.jpg') center 46%/cover no-repeat;
+  filter:saturate(.78) contrast(1.05)}
+/* Scrim keeps the wordmark legible over the sky and fades the bottom edge into
+   the page ink so the hero does not end on a hard rectangle. */
 .hero-plate::after{content:"";position:absolute;inset:0;background:
-    linear-gradient(180deg, rgba(13,15,12,.62) 0%, rgba(13,15,12,.86) 58%, var(--ink) 100%),
-    radial-gradient(120% 80% at 78% 6%, rgba(201,162,39,.16), transparent 55%)}
-.heroin{position:relative;z-index:2;padding:44px 28px 26px;max-width:var(--maxw);margin:0 auto}
+    linear-gradient(180deg,
+      rgba(13,15,12,.58) 0%, rgba(13,15,12,.84) 46%,
+      rgba(13,15,12,.95) 82%, var(--ink) 100%),
+    radial-gradient(110% 78% at 76% 8%, rgba(201,162,39,.15), transparent 58%)}
+.heroin{position:relative;z-index:2;padding:46px 28px 26px;
+  max-width:var(--maxw);margin:0 auto}
 h1{font-family:'Saira Condensed',sans-serif;font-weight:700;font-size:clamp(30px,4.2vw,46px);
   line-height:1;text-transform:uppercase;letter-spacing:.01em;margin-top:12px;
   display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 h1 .g{color:var(--gold)}
 h1 .mark{width:26px;height:26px;flex:none}
+h1 .sub{display:block;font-family:'Space Mono',monospace;font-size:12px;
+  letter-spacing:.26em;text-transform:uppercase;color:var(--mute);font-weight:400;
+  margin-top:12px}
 .tagline{color:var(--mute);font-weight:300;font-size:15.5px;margin-top:10px;max-width:640px}
 
 /* live telemetry strip in the hero - the same numbers the stages below report,
@@ -1048,12 +1065,14 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style></head><body>
 
+<div class="page">
 <header class="hero">
   <div class="hero-plate" role="img" aria-label="Airframe on station over a monitored perimeter at dusk"></div>
   <div class="heroin">
     <span class="eyebrow">Gray Tech Solutions &middot; Situational Awareness</span>
-    <h1><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polygon points="32,7 57,32 32,57 7,32" fill="none" stroke="#C9A227" stroke-width="5"/><polygon points="32,20 44,32 32,44 20,32" fill="#C9A227"/><polygon points="32,27 37,32 32,37 27,32" fill="#0D0F0C"/></svg>Gray Tech <span class="g">Security</span>
-        <span class="badge live" id="conn">connecting</span></h1>
+    <h1><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><polygon points="32,7 57,32 32,57 7,32" fill="none" stroke="#C9A227" stroke-width="5"/><polygon points="32,20 44,32 32,44 20,32" fill="#C9A227"/><polygon points="32,27 37,32 32,37 27,32" fill="#0D0F0C"/></svg><span>Astra<span class="g">Gaze</span></span>
+        <span class="badge live" id="conn">connecting</span>
+      <span class="sub">by Gray Tech Solutions</span></h1>
     <p class="tagline">Person detection first, identity second &mdash; over a monitored scene,
       with a match threshold derived from observed traffic rather than a generic default.
       Point stage 1 at your own camera and watch it work.</p>
@@ -1213,7 +1232,10 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
     <tr><th>Stage</th><th>Spec</th><th>This console, today</th><th>Status</th></tr>
     <tr><td>1 &middot; Find</td><td>YOLO person on a wide frame, gating everything after it</td><td>yolov8n on onnxruntime, reads the live scene; <code>POST /api/persons</code></td><td><span class="ok">live</span></td></tr>
     <tr><td>2 &middot; Gate</td><td>Quality gate before matching &mdash; blur, pose, face size</td><td>Face width, IOD and Laplacian sharpness measured per crop; refused before match</td><td><span class="ok">live</span></td></tr>
-    <tr><td>3 &middot; Identify</td><td>SCRFD &rarr; align &rarr; ArcFace (buffalo_l / antelopev2)</td><td>SCRFD + <b>MobileFaceNet</b> (buffalo_s), 512-d, CPU</td><td><span class="mid">swap the head</span></td></tr>
+    <tr><td>3 &middot; Identify</td><td>SCRFD &rarr; align &rarr; ArcFace (buffalo_l / antelopev2)</td>
+      <td>Detect <b>SCRFD-500M</b> (already the spec model). Embed is
+        <b>MobileFaceNet</b>, not ArcFace &mdash; the one head actually outstanding</td>
+      <td><span class="mid">swap embed head</span></td></tr>
     <tr><td>4 &middot; Search</td><td>FAISS, sub-ms at gallery scale</td><td>numpy cosine matmul over the 512-d index</td><td><span class="ok">fine to ~50k</span></td></tr>
     <tr><td>5 &middot; Temporal</td><td>ByteTrack; embed on new tracks, not every frame</td><td>one embed per crossing of the scan line</td><td><span class="mid">build</span></td></tr>
     <tr><td>6 &middot; Pixels</td><td>10&ndash;30&times; optical; &ge;80 px before ArcFace</td><td>fixed ground camera; measured px shown live above</td><td><span class="mid">needs optics</span></td></tr>
@@ -1504,6 +1526,10 @@ RTSP/H.265 from gimbal
   <span>Style aligned to graytechsolutions.dev</span>
 </footer>
 
+</footer>
+
+</div><!-- /.page -->
+
 <script>
 const cv = document.getElementById('scene'), cx = cv.getContext('2d');
 let lastEvents = [], paused = false;
@@ -1630,10 +1656,14 @@ function drawKpis(s){
   // it read 7 while five stick figures were on the picture.
   const inFrame=s.in_frame ?? s.present.length;
 
-  // Stage 1 - YOLO. Its own count, independent of everything below it.
+  // Stage 1 - YOLO. Reported as a HIT RATE, not a headcount. Each scanned
+  // portrait contains exactly one person, and YOLO finds well under one per
+  // image on tight headshots, so "people seen" implied a census it was not
+  // performing. The rate is the honest figure; the miss is stated underneath.
+  const perImg=(sp.frames? (sp.detections/sp.frames) : 0);
   document.getElementById('kpis1').innerHTML = kpiHtml([
-    ['People seen', sp.detections ?? 0, (sp.detections?'var(--cyn)':'')],
     ['Images checked', sp.frames ?? 0, ''],
+    ['Hit rate', sp.frames? Math.round(perImg*100)+'%' : '—', (perImg>=0.8?'var(--cyn)':'var(--amb)')],
     ['Named', 'none', 'var(--mute-2)'],
   ],true);
 
@@ -1667,14 +1697,17 @@ function drawKpis(s){
   // per crossing of the scan line, so neither number bounds the other and a
   // subset reading would be plainly wrong (stage 3 can exceed stage 1).
   document.getElementById('howline').innerHTML =
-    '<b>These three numbers do not add up, and are not meant to.</b> '+
-    'Stage 1 counts <span class="g">bodies per image</span> &mdash; '+(sp.detections??0)+
-    ' detections over '+(sp.frames??0)+' images &mdash; and it is unreliable on tight '+
-    'headshots, which is why it is the stage you point at a real scene. '+
-    'Stage 3 counts <span class="g">faces per crossing</span>: '+(st.identified??0)+
-    ' named against the enrolled gallery, '+(st.unknown??0)+' not in it. '+
-    'Neither number bounds the other, so a gap between them is not an error. '+
-    'Nothing here identifies anyone who has not been enrolled.';
+    '<b>Named can exceed stage 1 on this page, and that is not a paradox.</b> '+
+    'Stage 3 runs on every portrait crossing the scan line and names '+
+    '<span class="g">'+(st.identified??0)+'</span> of them. Stage 1 is YOLO '+
+    'person-find pointed at those same portraits, and it is <b>the wrong tool '+
+    'there</b> &mdash; a face cropped to fill the frame is not the distribution '+
+    'its person class was trained on. It found a body in '+
+    '<span class="g">'+(sp.frames?Math.round(perImg*100):0)+'%</span> of them. '+
+    'So stage 1 undercounts and stage 3 does not, and the hero line you saw was '+
+    'comparing a miss rate against a census. Stage 1 is pointed at a real scene '+
+    'instead &mdash; your own camera, above. Nothing here identifies anyone who '+
+    'has not been enrolled.';
 
   const off=(s.tracked ?? s.present.length) - inFrame;
   document.getElementById('scaninfo').innerHTML =
@@ -1686,7 +1719,10 @@ function drawKpis(s){
   // Hero strip - the same figures, so the top of the page is alive on arrival.
   const chips=[
     ['In frame', inFrame, 'var(--gold)'],
-    ['People seen', sp.detections ?? 0, (sp.detections?'var(--cyn)':'')],
+    // Hit rate, not a headcount. YOLO finds well under one person per portrait
+    // here, so a "people seen" figure next to "named" implied a census it was
+    // not performing and read as a contradiction.
+    ['YOLO hit rate', sp.frames? Math.round(perImg*100)+'%' : '—', (perImg>=0.8?'var(--cyn)':'var(--amb)')],
     ['Named', st.identified ?? 0, 'var(--grn)'],
     ['Face size', px.observed_median? Math.round(px.observed_median)+'px':'—', ''],
     ['Scan', (s.scan_ms||0).toFixed(0)+'ms', ''],
