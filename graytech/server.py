@@ -748,8 +748,21 @@ async def live_frame(file: UploadFile = File(...),
     res = personfinder.detect(img)
     res["tracks"] = _live_tracker(session).update(res.get("persons") or [])
     res["track_count"] = len(res["tracks"])
-    res["frame"] = {"w": int(img.shape[1]), "h": int(img.shape[0])}
+    ih, iw = int(img.shape[0]), int(img.shape[1])
+    res["frame"] = {"w": iw, "h": ih}
     res["find_ms"] = round((time.perf_counter() - t_find) * 1000, 1)
+
+    # Normalised box coordinates, alongside the pixel ones.
+    #
+    # The client should map with these and never with pixels. Pixel coordinates
+    # are only meaningful relative to the exact frame they were measured in, and
+    # every mismatch between "the frame we uploaded" and "the frame we drew"
+    # shows up as a box sliding off the subject. Normalised fractions survive any
+    # such disagreement, because they carry no dimensions at all.
+    for p in res.get("persons") or []:
+        x1, y1, x2, y2 = p["box"]
+        p["norm"] = [round(x1 / iw, 5), round(y1 / ih, 5),
+                     round(x2 / iw, 5), round(y2 / ih, 5)]
 
     # ── Stages 2 and 3 ───────────────────────────────────────────────────
     # Only bother at all if something was actually found. Running the face
@@ -1122,6 +1135,17 @@ button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
 .ctlbtn:hover{background:var(--gold-bright);border-color:var(--gold-bright);color:var(--ink)}
 .hud{position:relative;background:#050706;border:1px solid var(--line-2);
   aspect-ratio:16/9;overflow:hidden}
+/* A portrait camera gets a portrait panel. Forcing a 16:9 box around a 9:16 feed
+   is what forced the letterboxing in the first place: contain-fit inside 16:9
+   wastes over half the panel, and on a phone the HUD was a short letterboxed
+   strip with the subject cropped. Match the panel to the feed instead. */
+.hud.portrait{aspect-ratio:9/16;max-height:min(78vh,720px);margin-inline:auto}
+.hud.portrait .hud-telemetry{font-size:9.5px}
+.hud.portrait .hud-tl{left:12px;top:12px}
+@media(max-width:720px){
+  .hud{aspect-ratio:4/3}
+  .hud.portrait{aspect-ratio:3/4}
+}
 /* The <video> is the capture SOURCE only; it is not displayed.
    The canvas paints the frame itself, so the picture and the detection boxes
    are guaranteed to share one coordinate space. Letting CSS object-fit:cover
@@ -2004,7 +2028,44 @@ function coverDraw(ctx, src, sw, sh, alpha){
   if(alpha!=null){ ctx.globalAlpha=alpha; }
   ctx.drawImage(src, dx, dy, dw, dh);
   if(alpha!=null){ ctx.globalAlpha=1; }
-  return {k, dx, dy};
+  // Remember where the picture actually landed. Overlay geometry is then
+  // expressed against THIS rect, so a box cannot drift from the image even if
+  // some other scale is applied downstream.
+  lastDraw={dx,dy,dw,dh,sw,sh,W,H};
+  return lastDraw;
+}
+
+// CONTAIN, not cover.
+//
+// cover scales an image to fill the box and crops the overflow. With a portrait
+// camera feed in a landscape HUD that is catastrophic: a 720x1280 frame in a
+// 358px-wide box becomes dw=1134, dx=-388, so 776px of the picture - including
+// whatever was in the middle of it - is simply not drawn. The box was landing on
+// coordinates that had been cropped out of view, which is why the frame looked
+// permanently offset from the person no matter how the maths was written.
+//
+// contain scales to fit entirely inside the box, letterboxing the remainder, so
+// every pixel of the frame is on screen and overlay coordinates need no
+// correction at all. Letterbox bars are the honest presentation for a portrait
+// feed in a landscape panel.
+function containDraw(ctx, src, sw, sh, alpha){
+  const W=ctx.canvas.width, H=ctx.canvas.height;
+  const k=Math.min(W/sw, H/sh), dw=sw*k, dh=sh*k;
+  const dx=(W-dw)/2, dy=(H-dh)/2;
+  if(alpha!=null){ ctx.globalAlpha=alpha; }
+  ctx.drawImage(src, dx, dy, dw, dh);
+  if(alpha!=null){ ctx.globalAlpha=1; }
+  lastDraw={dx,dy,dw,dh,sw,sh,W,H};
+  return lastDraw;
+}
+let lastDraw=null;
+// Overlay geometry is resolved from normalised coordinates against the rect the
+// picture was actually drawn into. Two independent sources of truth, no
+// arithmetic linking pixel dimensions that may not correspond.
+function normRect(n){
+  const D=lastDraw||{dx:0,dy:0,dw:hcv.width,dh:hcv.height};
+  return { x: D.dx+n[0]*D.dw, y: D.dy+n[1]*D.dh,
+           w: (n[2]-n[0])*D.dw, h: (n[3]-n[1])*D.dh };
 }
 
 function escapeHtml(s){
@@ -2013,6 +2074,16 @@ function escapeHtml(s){
 }
 
 function hudSize(){
+  // Match the panel shape to the feed so a portrait camera is not letterboxed
+  // into a letterbox-thin strip. The class is applied BEFORE the canvas is
+  // measured, otherwise the backing store would be sized from the old shape.
+  let portrait=false;
+  if(!isStill && camStream && vid.videoWidth && vid.videoHeight){
+    portrait = vid.videoHeight > vid.videoWidth;
+  } else if(isStill && stillNatural){
+    portrait = stillNatural.h > stillNatural.w;
+  }
+  hud.classList.toggle('portrait', portrait);
   hcv.width=hud.clientWidth; hcv.height=hud.clientHeight;
 }
 
@@ -2098,6 +2169,7 @@ async function startCam(){
   try{
     const got=await openStream();
     camStream=got.stream;
+    stillMode=false;            // the live feed owns the panel from here
     vid.srcObject=camStream;
     // iOS Safari will not advance a muted autoplay video unless play() is
     // called from inside the user gesture, so this must stay awaited here
@@ -2225,37 +2297,25 @@ function drawOverlay(d, isStill){
   // <video> is a hidden capture source only; letting CSS scale it with
   // object-fit while the canvas used its own arithmetic is what left the boxes
   // permanently offset from the people they were tracking.
+  const fr=d.frame||{};
   if(!isStill){
     hx.clearRect(0,0,W,H);
-    // Draw with the geometry of the frame we POSTED, not the camera's reported
-    // dimensions. On iOS the video element reports sensor dimensions
-    // (landscape 1280x720) while drawImage applies the rotation metadata, so the
-    // picture is really portrait. Sizing the draw from videoWidth therefore
-    // disagreed with the uploaded frame's aspect, which threw every box off the
-    // person - and since the face was then outside the box, stage 2 found
-    // nothing and stage 3 had no name to report.
-    if(vid.readyState>=2 && vid.videoWidth){
-      coverDraw(hx, vid, postedW||vid.videoWidth, postedH||vid.videoHeight);
+    // Draw with the EXACT aspect the server detected in - its own reported
+    // frame dimensions - not videoWidth and not a remembered postedW/H.
+    //
+    // This is the fix for the horizontal drift. videoWidth is the sensor size
+    // and drawImage applies rotation metadata, so on a portrait phone the three
+    // candidate spaces (sensor, posted, drawn) did not agree, and any
+    // disagreement between them slides the box sideways off the person. Taking
+    // the server's numbers makes picture and boxes provably share one space:
+    // whatever the camera orientation, the draw matches what was detected.
+    if(vid.readyState>=2 && vid.videoWidth && fr.w && fr.h){
+      containDraw(hx, vid, fr.w, fr.h);
     }
   }
-  const fr=d.frame||{};
-  // COORDINATE SPACE, and this is where the box used to drift.
-  //
-  // The detector returns box coordinates in the pixel space of the image IT was
-  // given - pumpFrame downscales to 960px before uploading, so that is the space
-  // `d.frame` reports. Scaling those coordinates by the video element's own
-  // videoWidth (often 1280 or 1920) put every box a full person-width to the
-  // left and made it too wide, by exactly the ratio between the two.
-  //
-  // So: convert detection space -> CSS/video space first, then apply cover.
-  const dw=fr.w||W, dh=fr.h||H;              // detection space == posted space
-  // The posted frame IS the detection space, so there is no conversion factor
-  // to apply. One space, end to end: camera -> posted frame -> detection -> box.
-  const toVideo=1;
-  const vw=dw, vh=dh;
-  // Then object-fit:cover into the HUD box: uniform scale, overflow centred.
-  const k=Math.max(W/vw, H/vh), ox=(W-vw*k)/2, oy=(H-vh*k)/2;
-  const sx=k, sy=k;
+  // Geometry comes from the server as NORMALISED fractions, resolved against the
+  // rect the picture was actually drawn into (lastDraw). No pixel arithmetic
+  // links the two, so there is no ratio left to get wrong.
   const tracksByBox={};
   (d.tracks||[]).forEach(t=>{ tracksByBox[t.box.map(Math.round).join(',')]=t; });
 
@@ -2286,8 +2346,13 @@ function drawOverlay(d, isStill){
     // there - which reads as "the square is missing above the person" even
     // though the box exists. Clamping keeps the outline closed and still sits it
     // on the person, because only the off-canvas sliver is trimmed.
-    let X=b[0]*toVideo*k+ox, Y=b[1]*toVideo*k+oy,
-        BW=(b[2]-b[0])*toVideo*k, BH=(b[3]-b[1])*toVideo*k;
+    // Geometry from the server's NORMALISED coords, resolved against the rect the
+    // picture was actually drawn into. No pixel arithmetic links the two, so
+    // there is no ratio that can be miscalculated.
+    const nr=normRect(p.norm||(fr.w&&fr.h
+      ? [b[0]/fr.w, b[1]/fr.h, b[2]/fr.w, b[3]/fr.h]
+      : [0,0,1,1]));
+    let X=nr.x, Y=nr.y, BW=nr.w, BH=nr.h;
     const cx0=Math.max(0,X), cy0=Math.max(0,Y),
           cx1=Math.min(W,X+BW), cy1=Math.min(H,Y+BH);
     if(cx1<=cx0||cy1<=cy0){ return; }          // entirely outside: nothing to draw
@@ -2304,22 +2369,39 @@ function drawOverlay(d, isStill){
              : stage==='checked'? C.gold
              : tr? C.cyan : C.gold;
 
-    // A named person gets an inner face box as well, so it is obvious the name
-    // came from a face measurement inside the person box and not the body box.
-    if(idrec && idrec.face){
-      const fb=idrec.face.bbox;
-      const FX=fb[0]*toVideo*k+ox, FY=fb[1]*toVideo*k+oy,
-            FW=(fb[2]-fb[0])*toVideo*k, FH=(fb[3]-fb[1])*toVideo*k;
-      hx.strokeStyle=C.grn; hx.lineWidth=Math.max(1,lw*1.4);
-      hx.setLineDash([4,3]);
-      hx.strokeRect(FX,FY,FW,FH);
-      hx.setLineDash([]);
+    // A named person gets a solid inner face box, drawn INSIDE the face reticle
+    // rather than replacing it, so the name is visibly tied to the face.
+    if(onFace && stage==='named'){
+      hx.strokeStyle=C.grn; hx.lineWidth=Math.max(1,lw*1.2);
+      hx.strokeRect(X,Y,BW,BH);
     }
 
-    // Fit the reticle to the person, not to the frame. YOLO boxes are
-    // person-agnostic rectangles that often include a lot of background, so
-    // draw corner brackets rather than a full outline - it reads as a lock and
-    // does not imply the box is a segmentation.
+    // Fit the reticle to the FACE once we have one.
+    //
+    // YOLO's person class returns whole-body rectangles, so framing those is
+    // technically correct but useless as a targeting readout: the interesting
+    // part of a person is 10% of the box and the rest is torso and legs. The
+    // face box comes from SCRFD at stage 2, so once it exists it becomes the
+    // primary reticle and the body box drops back to a faint context outline.
+    let bodyX=X, bodyY=Y, bodyW=BW, bodyH=BH;
+    const fdet = idrec && idrec.face;
+    if(fdet && BW>26 && BH>26){
+      const fn2=normRect((fr.w&&fr.h)
+        ? [fdet.bbox[0]/fr.w, fdet.bbox[1]/fr.h, fdet.bbox[2]/fr.w, fdet.bbox[3]/fr.h]
+        : [0,0,0,0]);
+      if(fn2.w>6 && fn2.h>6){
+        X=fn2.x; Y=fn2.y; BW=fn2.w; BH=fn2.h;
+      }
+    }
+    const onFace = (X!==bodyX);
+
+    // Context outline for the body, so you can still see what was detected.
+    if(onFace){
+      hx.strokeStyle='rgba(99,199,212,.34)'; hx.lineWidth=1;
+      hx.setLineDash([3,4]);
+      hx.strokeRect(bodyX,bodyY,bodyW,bodyH);
+      hx.setLineDash([]);
+    }
     const lw=Math.max(1.25, Math.min(BW,BH)/90);
     hx.strokeStyle=col; hx.lineWidth=lw;
     hx.strokeRect(X,Y,BW,BH);
@@ -2355,6 +2437,7 @@ function drawOverlay(d, isStill){
     const stageTxt = stage==='named' ? (idrec.name||'').replace(/_/g,' ')
                    : stage==='gated'  ? 'HELD AT CHECK'
                    : stage==='checked'? 'CHECKING'
+                   : onFace? 'FACE FOUND'
                    : 'NO FACE';
     const lbl=stageTxt+'  '+px+
               (tr? '  ·  TRACK '+tr.id : '')+
@@ -2414,6 +2497,16 @@ function drawOverlay(d, isStill){
 // from the real model, so the HUD is still demonstrating something true, and the
 // caption never claims it is live.
 async function showStill(reason){
+  // Never fall back while a live camera is running.
+  //
+  // showStill() is async: it fetches the image and waits for it to decode. On
+  // page load it starts immediately, so pressing Start camera while it is still
+  // in flight used to mean the still finished afterwards and re-set stillMode,
+  // freezing the panel on the stored frame with the live feed running unseen
+  // behind it. Real report: the camera "stopped passing through" after the
+  // still-on-load change. Re-check at every await, because the user can start
+  // the camera at any point during those awaits.
+  if(camStream) return;
   const stills=['/deck-assets/aerial-field.jpg','/deck-assets/fence-climb.jpg',
                 '/deck-assets/drone-cover.jpg'];
   for(const src of stills){
@@ -2421,11 +2514,13 @@ async function showStill(reason){
       const r=await fetch(src,{cache:'force-cache'});
       if(!r.ok) continue;
       const blob=await r.blob();
+      if(camStream) return;          // camera started during the fetch
       const fd=new FormData(); fd.append('file',blob,'still.jpg');
       const res=await fetch('/api/live/frame?session='+encodeURIComponent(SESSION)+'still',
                             {method:'POST',body:fd});
       if(!res.ok) continue;
       const d=await res.json();
+      if(camStream) return;          // ...or during the upload
       vid.srcObject=null;
       stillMode=true;
       hudEmpty.hidden=true;
@@ -2454,7 +2549,7 @@ function paintStillFrame(src){
       hcv.width=W; hcv.height=H;
       hx.clearRect(0,0,W,H);
       stillNatural={w:im.naturalWidth,h:im.naturalHeight};
-      coverDraw(hx, im, im.naturalWidth, im.naturalHeight, .72);
+      containDraw(hx, im, im.naturalWidth, im.naturalHeight, .85);
       resolve();
     };
     im.onerror=()=>reject(new Error('still failed to load'));
@@ -2464,6 +2559,8 @@ function paintStillFrame(src){
 let stillNatural=null;
 
 camBtn.addEventListener('click',e=>{ e.stopPropagation(); camStream? stopCam() : startCam(); });
+// Any late-arriving still must never re-take the panel.
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden) hudSize(); });
 camSel.addEventListener('change',()=>{ if(camStream){ stopCam(); } });
 
 // Click the frame to go full-screen, the way a video call does. Escape or a
@@ -2492,6 +2589,16 @@ if(navigator.mediaDevices&&navigator.mediaDevices.enumerateDevices) listCams();
 // only be corrected when the camera started, so the overlay was drawn into a
 // buffer a quarter of the display size and then stretched by CSS.
 hudSize();
+
+// Paint the stored-frame HUD immediately on load.
+//
+// showStill() used to run ONLY from inside startCam()'s catch block, which meant
+// the panel sat completely empty until somebody deliberately pressed Start
+// camera and had it refused. That is exactly backwards: the still exists for the
+// case where there is no camera, so it has to be what renders when nothing has
+// been started. Real report: the panel looked broken until Start camera was
+// pressed.
+showStill('Camera off.');
 
 async function togglePause(){
   const r=await fetch('/api/pause',{method:'POST'});
