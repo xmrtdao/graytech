@@ -227,6 +227,55 @@ class _Face:
         matrix = np.stack(vecs).astype(np.float32) if vecs else np.zeros((0, 512), np.float32)
         return out, matrix
 
+    def embed_bytes(self, img) -> tuple[list[dict], np.ndarray]:
+        """
+        Detect and embed every face in an already-decoded BGR image.
+
+        Same telemetry as embed(), and the same one-shot detection + alignment +
+        embedding pass. Split out from embed() so the live HUD can run the face
+        model against a frame it has already decoded for person detection,
+        rather than decoding the same JPEG a second time.
+        """
+        faces, vecs = [], []
+        ih, iw = img.shape[:2]
+        for f in self.app.get(img):
+            vec = np.asarray(f.normed_embedding, dtype=np.float32).reshape(-1)
+            if vec.shape[0] != 512:
+                continue
+            x1, y1, x2, y2 = [int(v) for v in f.bbox]
+            face_px = float(max(0, x2 - x1))
+            try:
+                ex1, ey1 = float(f.kps[0][0]), float(f.kps[0][1])
+                ex2, ey2 = float(f.kps[1][0]), float(f.kps[1][1])
+                iod_px = float(np.hypot(ex2 - ex1, ey2 - ey1))
+            except Exception:                                   # noqa: BLE001
+                iod_px = 0.0
+            sharpness = 0.0
+            try:
+                pad = int(face_px * 0.15)
+                crop = img[max(0, y1 - pad):min(ih, y2 + pad),
+                           max(0, x1 - pad):min(iw, x2 + pad)]
+                if crop.size:
+                    import cv2
+                    sharpness = float(cv2.Laplacian(
+                        cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
+            except Exception:                                   # noqa: BLE001
+                sharpness = 0.0
+            faces.append({
+                "bbox": [x1, y1, x2, y2],
+                "det_score": round(float(f.det_score), 4),
+                "landmarks": [[round(float(px), 1), round(float(py), 1)]
+                              for px, py in f.kps],
+                "face_px": round(face_px, 1),
+                "iod_px": round(iod_px, 1),
+                "sharpness": round(sharpness, 1),
+                "band": pixel_band(face_px),
+            })
+            vecs.append(_l2(vec))
+        matrix = (np.stack(vecs).astype(np.float32) if vecs
+                  else np.zeros((0, 512), np.float32))
+        return faces, matrix
+
     def match(self, matrix: np.ndarray, k: int = 1) -> list[list[dict]]:
         """Nearest identities by cosine similarity, per detected face."""
         if matrix.size == 0:

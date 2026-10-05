@@ -710,14 +710,26 @@ def _live_tracker(session: str) -> Tracker:
 
 
 @application.post("/api/live/frame")
-async def live_frame(file: UploadFile = File(...), session: str = "default") -> dict:
+async def live_frame(file: UploadFile = File(...),
+                     session: str = "default",
+                     identify: bool = True) -> dict:
     """
-    One frame from the viewer's own camera: detect, track, hand back boxes.
+    One frame from the viewer's own camera: find, check, name.
 
-    Detection and tracking only. This endpoint does not enrol anybody, does not
-    touch the identity gallery, and returns no names - which is why it is safe
-    to point at a camera in a room that happens to contain the person reading
-    this page.
+    Three stages, in order, on the same frame:
+
+      1. YOLO finds people and the tracker gives each a box a track ID. No
+         gallery is involved and this stage works on its own.
+      2. The quality gate measures the face crop - width, inter-ocular
+         distance, sharpness - and refuses anything it cannot judge. A refused
+         face is reported as refused, never as "unknown person".
+      3. Only faces that passed the gate are embedded and matched against the
+         enrolled gallery. A name can only come from a reference somebody
+         enrolled; anyone else comes back unidentified.
+
+    Identity is scoped to a consented gallery, never a general face search, and
+    nothing is written: no enrolment, no stored frames, no names added to a
+    track that did not earn one.
     """
     if not personfinder.available:
         raise HTTPException(503, f"stage 1 unavailable: {personfinder.detail}")
@@ -732,11 +744,108 @@ async def live_frame(file: UploadFile = File(...), session: str = "default") -> 
     if img is None:
         raise HTTPException(400, "undecodable frame")
 
+    t_find = time.perf_counter()
     res = personfinder.detect(img)
     res["tracks"] = _live_tracker(session).update(res.get("persons") or [])
     res["track_count"] = len(res["tracks"])
     res["frame"] = {"w": int(img.shape[1]), "h": int(img.shape[0])}
+    res["find_ms"] = round((time.perf_counter() - t_find) * 1000, 1)
+
+    # ── Stages 2 and 3 ───────────────────────────────────────────────────
+    # Only bother at all if something was actually found. Running the face
+    # model on an empty frame is the exact waste the workup warns about.
+    # NOTE: nest under "identify". Spreading the dict with res.update() flattened
+    # ran/named/gated/people into the top level, so the client looking for
+    # res["identify"] found nothing and every stage read as absent.
+    res["identify"] = (_identify_in_frame(img, res["persons"])
+                       if (identify and res.get("persons"))
+                       else {"ran": False,
+                             "why": ("no person in frame" if identify
+                                     else "identity disabled for this request")})
     return res
+
+
+def _identify_in_frame(img, persons: list[dict]) -> dict:
+    """
+    Check and name, per detected person.
+
+    The face model runs once on the whole frame rather than per person: SCRFD
+    finds every face at once, and re-running it inside a crop per box would be
+    both slower and less accurate, because a crop of a crop has already lost
+    the pixels the detector needed.
+
+    Faces are then attached to people by overlap, so the name belongs to the box
+    it was actually measured from.
+    """
+    out = {"ran": True, "people": [], "named": 0, "gated": 0,
+           "face_ms": 0.0, "gallery": len(recogniser.names)}
+    try:
+        t0 = time.perf_counter()
+        faces, matrix = recogniser.embed_bytes(img)
+        out["face_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    except Exception as exc:                                # noqa: BLE001
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    matches = recogniser.match(matrix, k=1) if matrix.size else []
+    ih, iw = img.shape[:2]
+
+    for i, p in enumerate(persons):
+        px1, py1, px2, py2 = p["box"]
+        rec = {"box": p["box"], "conf": p["conf"], "stage": "found"}
+
+        # Nearest face whose centre falls inside this person's box.
+        best, best_d = None, 1e18
+        for fi, f in enumerate(faces):
+            fx = (f["bbox"][0] + f["bbox"][2]) / 2
+            fy = (f["bbox"][1] + f["bbox"][3]) / 2
+            if not (px1 <= fx <= px2 and py1 <= fy <= py2):
+                continue
+            d = (fx - (px1 + px2) / 2) ** 2 + (fy - (py1 + py2) / 2) ** 2
+            if d < best_d:
+                best, best_d = fi, d
+
+        if best is None:
+            # A body with no face in it: turned away, occluded, or too small.
+            rec.update(stage="found", face=None, name=None,
+                       note="no face in this box")
+            out["people"].append(rec)
+            continue
+
+        f = faces[best]
+        rec["face"] = {"bbox": f["bbox"], "face_px": f.get("face_px"),
+                       "iod_px": f.get("iod_px"),
+                       "sharpness": f.get("sharpness"),
+                       "band": f.get("band")}
+
+        # ── Stage 2: the quality gate, before any matching ───────────────
+        reasons = []
+        if f.get("face_px") is not None and f["face_px"] < faceapp.PX_DETECT:
+            reasons.append(f"face {f['face_px']:.0f}px < {faceapp.PX_DETECT:.0f}px")
+        if (f.get("sharpness") is not None
+                and f["sharpness"] < faceapp.SHARPNESS_MIN):
+            reasons.append(f"sharp {f['sharpness']:.0f} < {faceapp.SHARPNESS_MIN:.0f}")
+        if reasons:
+            rec.update(stage="gated", name=None, reason="; ".join(reasons))
+            out["gated"] += 1
+            out["people"].append(rec)
+            continue
+
+        rec["stage"] = "checked"
+        # ── Stage 3: name, against the enrolled gallery only ─────────────
+        row = matches[best] if best < len(matches) else []
+        top = row[0] if row else None
+        if top and top.get("matched"):
+            rec.update(stage="named", name=top["name"],
+                       cosine=round(float(top["cosine"]), 4))
+            out["named"] += 1
+        else:
+            rec.update(stage="unidentified", name=None,
+                       cosine=(round(float(top["cosine"]), 4) if top else None))
+        out["people"].append(rec)
+
+    del ih, iw
+    return out
 
 
 @application.post("/api/live/stop")
@@ -1877,7 +1986,10 @@ const SESSION=(crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.ran
 // re-animated on every SSE frame, and an arrival is only ever added once.
 let seenEvents=new Set(), lastLogT=0;
 let camStream=null, camLoop=null, camBusy=false, camFrames=0, stillMode=false,
-    camFails=0, lastGoodVideoConstraint=null;
+    camFails=0, lastGoodVideoConstraint=null,
+    // Dimensions of the last frame uploaded for detection. The overlay maps
+    // every box through these, not through videoWidth/videoHeight.
+    postedW=0, postedH=0;
 // Per-track rectangle smoothing state. Kept in source-pixel space so the
 // filter does not change behaviour when the HUD is resized or expanded.
 const smoothBox={}, smoothAge={};
@@ -2075,6 +2187,11 @@ async function pumpFrame(){
     const off=document.createElement('canvas');
     const W=vid.videoWidth||640, H=vid.videoHeight||480;
     off.width=Math.min(W,960); off.height=Math.round(off.width*H/W);
+    // Record what we actually upload. The overlay maps boxes using these exact
+    // dimensions rather than the camera's reported ones, because on iOS the two
+    // disagree: videoWidth is the sensor's landscape size while drawImage honours
+    // the rotation metadata, so the real frame is portrait.
+    postedW=off.width; postedH=off.height;
     off.getContext('2d').drawImage(vid,0,0,off.width,off.height);
     const blob=await new Promise(r=>off.toBlob(r,'image/jpeg',0.72));
     if(!blob) return;
@@ -2110,8 +2227,15 @@ function drawOverlay(d, isStill){
   // permanently offset from the people they were tracking.
   if(!isStill){
     hx.clearRect(0,0,W,H);
+    // Draw with the geometry of the frame we POSTED, not the camera's reported
+    // dimensions. On iOS the video element reports sensor dimensions
+    // (landscape 1280x720) while drawImage applies the rotation metadata, so the
+    // picture is really portrait. Sizing the draw from videoWidth therefore
+    // disagreed with the uploaded frame's aspect, which threw every box off the
+    // person - and since the face was then outside the box, stage 2 found
+    // nothing and stage 3 had no name to report.
     if(vid.readyState>=2 && vid.videoWidth){
-      coverDraw(hx, vid, vid.videoWidth, vid.videoHeight);
+      coverDraw(hx, vid, postedW||vid.videoWidth, postedH||vid.videoHeight);
     }
   }
   const fr=d.frame||{};
@@ -2124,15 +2248,14 @@ function drawOverlay(d, isStill){
   // left and made it too wide, by exactly the ratio between the two.
   //
   // So: convert detection space -> CSS/video space first, then apply cover.
-  const dw=fr.w||W, dh=fr.h||H;              // detection space
-  const vw=isStill ? (stillNatural&&stillNatural.w || dw)
-                   : (vid.videoWidth||dw);  // what the <video> is showing
-  const vh=isStill ? (stillNatural&&stillNatural.h || dh)
-                   : (vid.videoHeight||dh);
-  const toVideo=dw? (vw/dw) : 1;             // detection px -> video px
-  // Then object-fit:cover: uniform scale = max of the axis ratios, overflow centred.
+  const dw=fr.w||W, dh=fr.h||H;              // detection space == posted space
+  // The posted frame IS the detection space, so there is no conversion factor
+  // to apply. One space, end to end: camera -> posted frame -> detection -> box.
+  const toVideo=1;
+  const vw=dw, vh=dh;
+  // Then object-fit:cover into the HUD box: uniform scale, overflow centred.
   const k=Math.max(W/vw, H/vh), ox=(W-vw*k)/2, oy=(H-vh*k)/2;
-  const sx=k*toVideo, sy=k*toVideo;
+  const sx=k, sy=k;
   const tracksByBox={};
   (d.tracks||[]).forEach(t=>{ tracksByBox[t.box.map(Math.round).join(',')]=t; });
 
@@ -2169,7 +2292,29 @@ function drawOverlay(d, isStill){
           cx1=Math.min(W,X+BW), cy1=Math.min(H,Y+BH);
     if(cx1<=cx0||cy1<=cy0){ return; }          // entirely outside: nothing to draw
     X=cx0; Y=cy0; BW=cx1-cx0; BH=cy1-cy0;
-    const col=tr? C.cyan : C.gold;
+    // ── Stage 3 → 2 → 1, made visible on the box itself ──────────────────
+    // The HUD now runs all three stages on this frame, so the box carries the
+    // verdict: cyan while it is only a body, gold while the face is being
+    // checked, green once a name is attached.
+    const idrec=(id=(d.identify||{}).people||[]).find(q=>q&&q.box&&
+                 q.box[0]===p.box[0]&&q.box[2]===p.box[2]) || null;
+    const stage=idrec? idrec.stage : 'found';
+    const col= stage==='named'? C.grn
+             : stage==='gated'? C.amb
+             : stage==='checked'? C.gold
+             : tr? C.cyan : C.gold;
+
+    // A named person gets an inner face box as well, so it is obvious the name
+    // came from a face measurement inside the person box and not the body box.
+    if(idrec && idrec.face){
+      const fb=idrec.face.bbox;
+      const FX=fb[0]*toVideo*k+ox, FY=fb[1]*toVideo*k+oy,
+            FW=(fb[2]-fb[0])*toVideo*k, FH=(fb[3]-fb[1])*toVideo*k;
+      hx.strokeStyle=C.grn; hx.lineWidth=Math.max(1,lw*1.4);
+      hx.setLineDash([4,3]);
+      hx.strokeRect(FX,FY,FW,FH);
+      hx.setLineDash([]);
+    }
 
     // Fit the reticle to the person, not to the frame. YOLO boxes are
     // person-agnostic rectangles that often include a lot of background, so
@@ -2204,8 +2349,17 @@ function drawOverlay(d, isStill){
     // Label pinned to the box, flipped inside when it would leave the frame.
     const fsz=Math.max(9, Math.min(15, Math.round(Math.min(BW,BH)/16)));
     const px=Math.round(p.conf*100)+'%';
-    const lbl=(tr? ('TRACK '+tr.id+' · '+tr.hits+' HIT'+(tr.hits===1?'':'S')) : 'UNTRACKED')+'  '+px;
-    hx.font='600 '+fsz+'px "Space Mono",monospace';
+    // The label states the stage the person is actually at. "unidentified" is
+    // spelled out rather than left blank: a person in frame that we decline to
+    // name is a result, not a gap.
+    const stageTxt = stage==='named' ? (idrec.name||'').replace(/_/g,' ')
+                   : stage==='gated'  ? 'HELD AT CHECK'
+                   : stage==='checked'? 'CHECKING'
+                   : 'NO FACE';
+    const lbl=stageTxt+'  '+px+
+              (tr? '  ·  TRACK '+tr.id : '')+
+              (idrec&&idrec.cosine!=null? '  ·  '+idrec.cosine.toFixed(3) : '');
+    hx.font='700 '+fsz+'px "Space Mono",monospace';
     const tw=hx.measureText(lbl).width, pad=Math.max(3,fsz*0.4), bh=fsz+pad*2;
     let lx=X, ly=Y-bh-2;
     if(ly<0) ly=Y+2;                       // no room above -> sit inside the top
@@ -2217,6 +2371,7 @@ function drawOverlay(d, isStill){
   });
 
   const n=(d.persons||[]).length;
+  const ident=d.identify||{};
   if(isStill){
     hudId.textContent = 'STILL · '+(n ? (n+' PERSON'+(n===1?'':'S')) : 'NO PERSON');
     // A still has exactly one frame and no history, so a track ID here would be
@@ -2224,25 +2379,31 @@ function drawOverlay(d, isStill){
     // instead of implying the tracker did something it did not.
     paintTelemetry([
       ['SOURCE', 'stored frame'],
-      ['STAGE 1', d.ok?'YOLOV8N':'—'],
-      ['PERSONS', n],
-      ['CONF', n? ('≥ '+(d.conf||0.25)) : '—'],
+      ['1 FIND', (d.ok?'YOLO ':'')+n],
+      ['2 CHECK', ident.ran? ((ident.gated? ident.gated+' held':'clear')):'—'],
+      ['3 NAME', ident.ran? ((ident.named||0)+' named'):'—'],
       ['TRACKS', 'none (still)'],
       ['LATENCY', Math.round(d.ms||0)+' ms'],
       ['FRAME', (fr.w||0)+'×'+(fr.h||0)],
     ]);
     return;
   }
-  hudId.textContent = n
-    ? 'PERSON — '+n+' · TRACKS '+(d.track_count||0)
-    : 'SCANNING · NO PERSON';
+  const named=ident.named||0, gated=ident.gated||0;
+  hudId.textContent = named
+    ? 'IDENTIFIED — '+named+(n>1? ' of '+n+' PEOPLE':' PERSON')
+    : (n? 'PERSON — '+n+' · NOT IDENTIFIED'
+         : 'SCANNING · NO PERSON');
+  // The telemetry strip is the find / check / name story, in that order, with
+  // the real per-stage timings.
   paintTelemetry([
-    ['STAGE 1', d.ok?'YOLOV8N':'—'],
-    ['PERSONS', n],
-    ['TRACKS', d.track_count||0],
-    ['CONF', '≥ '+(d.conf||0.25)],
-    ['LATENCY', Math.round(d.ms||0)+' ms'],
-    ['SOURCE', (fr.w||0)+'×'+(fr.h||0)],
+    ['1 FIND', (d.ok?'YOLO ':'')+n+(d.track_count? ' · '+d.track_count+' tracked':'')],
+    ['2 CHECK', ident.ran? ((gated? gated+' held':'clear')+
+                            (ident.face_ms? ' · '+Math.round(ident.face_ms)+'ms':''))
+                        : (ident.why||'—')],
+    ['3 NAME', ident.ran? (named? named+' named'
+                          : (n? '0 of '+n+' in gallery':'—')) : '—'],
+    ['GALLERY', (ident.gallery!=null? ident.gallery+' enrolled':'—')],
+    ['FIND', Math.round(d.find_ms||d.ms||0)+' ms'],
     ['FRAMES', camFrames],
   ]);
 }
