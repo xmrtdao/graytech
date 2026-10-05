@@ -2075,13 +2075,19 @@ function escapeHtml(s){
 
 function hudSize(){
   // Match the panel shape to the feed so a portrait camera is not letterboxed
-  // into a letterbox-thin strip. The class is applied BEFORE the canvas is
-  // measured, otherwise the backing store would be sized from the old shape.
+  // into a thin strip. The class is applied BEFORE the canvas is measured,
+  // otherwise the backing store would be sized from the old shape.
+  //
+  // stillMode is the module-level flag, NOT the isStill parameter of
+  // drawOverlay(). Referencing isStill here threw a ReferenceError on load,
+  // which aborted the script before the click listener was ever attached -
+  // so the button sat on "Starting..." forever and the camera could never be
+  // started. node --check passes this happily: it validates syntax, not names.
   let portrait=false;
-  if(!isStill && camStream && vid.videoWidth && vid.videoHeight){
-    portrait = vid.videoHeight > vid.videoWidth;
-  } else if(isStill && stillNatural){
+  if(stillMode && stillNatural){
     portrait = stillNatural.h > stillNatural.w;
+  } else if(camStream && vid.videoWidth && vid.videoHeight){
+    portrait = vid.videoHeight > vid.videoWidth;
   }
   hud.classList.toggle('portrait', portrait);
   hcv.width=hud.clientWidth; hcv.height=hud.clientHeight;
