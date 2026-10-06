@@ -7,3 +7,11 @@ face-service/models/
 face-service/identities/
 __pycache__/
 *.pyc
+
+# InsightFace model packs, downloaded at runtime by insightface itself.
+# buffalo_s unpacks to ~158 MB and the .zip is kept alongside it, so ~280 MB
+# total. Vendoring them would put hundreds of megabytes of third-party weights
+# in the repository, and they carry their own licence - see the Licence section
+# of README.md.
+models/
+
