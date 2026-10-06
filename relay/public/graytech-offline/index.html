@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AstraGaze by Gray Tech Solutions</title>
+<meta name="description" content="AstraGaze by Gray Tech Solutions - live face recognition and tracking for physical security. The live console is temporarily offline; the system overview is here.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@400;500;600;700;800&family=Barlow:wght@300;400;500;600&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#0D0F0C; --ink-2:#111310; --ink-3:#171A15;
+  --line:#2A2E25; --line-2:#3A3F31;
+  --gold:#C9A227; --gold-bright:#E4BB3A;
+  --paper:#ECEDE6; --mute:#9AA091; --mute-2:#6C7263;
+  --grn:#8FC97A; --amb:#DC8A1E; --red:#E4695A; --cyn:#63C7D4;
+  --maxw:1180px;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  margin:0; background:var(--ink); color:var(--paper);
+  font-family:'Barlow',system-ui,sans-serif; font-weight:400;
+  line-height:1.6; -webkit-font-smoothing:antialiased;
+}
+h1,h2,h3,.cond{font-family:'Saira Condensed',sans-serif; font-weight:700; letter-spacing:.01em; margin:0}
+.mono{font-family:'Space Mono',monospace}
+.wrap{max-width:var(--maxw); margin:0 auto; padding:0 28px}
+
+/* ── the outage notice ──────────────────────────────────────────────────────
+   This is the only reason the page exists, so it is the first thing on it.
+   It states plainly that the console is down and does not pretend the page is
+   the product. A fallback that looks like the working thing is worse than an
+   outage: someone concludes the system is broken rather than unavailable. */
+.notice{
+  border-bottom:1px solid var(--line); background:var(--ink-2);
+  padding:14px 0; font-size:14px;
+}
+.notice .wrap{display:flex; gap:14px; align-items:center; flex-wrap:wrap}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--amb);flex:none;
+  box-shadow:0 0 0 3px rgba(220,138,30,.15); animation:pulse 2.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){.dot{animation:none}}
+.notice b{color:var(--amb); font-weight:600}
+.notice .live{margin-left:auto; font-size:12px; color:var(--mute-2)}
+.notice a{color:var(--gold-bright)}
+
+/* ── header ──────────────────────────────────────────────────────────────── */
+header{border-bottom:1px solid var(--line); background:var(--ink-2)}
+header .wrap{display:flex; align-items:center; gap:28px; padding-top:20px; padding-bottom:20px; flex-wrap:wrap}
+.mark{font-family:'Saira Condensed',sans-serif; font-weight:800; font-size:26px; line-height:1; letter-spacing:.02em}
+.mark span{color:var(--gold)}
+.tag{font-size:12px; color:var(--mute-2); letter-spacing:.14em; text-transform:uppercase; font-family:'Space Mono',monospace}
+nav{margin-left:auto; display:flex; gap:22px; flex-wrap:wrap}
+nav a{color:var(--mute); text-decoration:none; font-size:14px; border-bottom:1px solid transparent; padding-bottom:2px}
+nav a:hover{color:var(--paper); border-bottom-color:var(--gold)}
+
+/* ── hero ────────────────────────────────────────────────────────────────── */
+.hero{padding:84px 0 68px; border-bottom:1px solid var(--line);
+  background:radial-gradient(ellipse 80% 60% at 18% 0%, rgba(201,162,39,.07), transparent 62%)}
+.eyebrow{font-family:'Space Mono',monospace; font-size:12px; letter-spacing:.2em;
+  text-transform:uppercase; color:var(--gold); margin-bottom:20px}
+.hero h1{font-size:clamp(2.4rem,7vw,4.6rem); line-height:.98; max-width:16ch}
+.hero h1 em{font-style:normal; color:var(--gold-bright)}
+.lede{margin-top:22px; font-size:clamp(1.05rem,2.1vw,1.3rem); color:var(--mute);
+  font-weight:300; max-width:60ch}
+.cta{display:flex; gap:14px; margin-top:34px; flex-wrap:wrap}
+.btn{display:inline-block; padding:13px 24px; border:1px solid var(--gold);
+  color:var(--gold-bright); text-decoration:none; font-family:'Saira Condensed',sans-serif;
+  font-weight:600; font-size:17px; letter-spacing:.04em; text-transform:uppercase;
+  transition:background .15s,color .15s; background:transparent}
+.btn:hover{background:var(--gold); color:var(--ink)}
+.btn.ghost{border-color:var(--line-2); color:var(--mute)}
+.btn.ghost:hover{border-color:var(--mute); background:transparent; color:var(--paper)}
+
+/* ── stages ──────────────────────────────────────────────────────────────── */
+section{padding:64px 0; border-bottom:1px solid var(--line)}
+.sec-head{display:flex; align-items:baseline; gap:18px; margin-bottom:38px; flex-wrap:wrap}
+.sec-head h2{font-size:clamp(1.5rem,3.4vw,2.1rem)}
+.sec-head .n{font-family:'Space Mono',monospace; color:var(--gold); font-size:13px}
+.sec-head p{margin:0; color:var(--mute-2); font-size:14px; flex-basis:100%}
+.stages{display:grid; gap:1px; background:var(--line); border:1px solid var(--line); grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.stage{background:var(--ink-3); padding:26px 22px}
+.stage .idx{font-family:'Space Mono',monospace; font-size:11px; color:var(--mute-2); letter-spacing:.16em}
+.stage h3{font-size:1.35rem; margin:10px 0 8px}
+.stage p{margin:0; color:var(--mute); font-size:14.5px; font-weight:300}
+.stage .model{margin-top:14px; padding-top:12px; border-top:1px solid var(--line);
+  font-family:'Space Mono',monospace; font-size:11.5px; color:var(--mute-2); word-break:break-word}
+.stage .model b{color:var(--cyn); font-weight:400}
+
+/* ── capability table ────────────────────────────────────────────────────── */
+table{width:100%; border-collapse:collapse; font-size:14.5px}
+caption{text-align:left; color:var(--mute-2); font-size:13px; padding-bottom:14px}
+th,td{text-align:left; padding:13px 14px; border-bottom:1px solid var(--line); vertical-align:top}
+thead th{font-family:'Saira Condensed',sans-serif; text-transform:uppercase; letter-spacing:.1em;
+  font-size:13px; color:var(--mute-2); border-bottom-color:var(--line-2)}
+tbody tr:last-child td{border-bottom:none}
+td code{font-family:'Space Mono',monospace; font-size:12.5px; color:var(--cyn)}
+.pill{display:inline-block; padding:2px 9px; border:1px solid currentColor; font-size:11px;
+  font-family:'Space Mono',monospace; letter-spacing:.08em; text-transform:uppercase}
+.pill.live{color:var(--grn)}
+.pill.gate{color:var(--amb)}
+
+/* ── constraints ─────────────────────────────────────────────────────────── */
+.grid2{display:grid; gap:1px; background:var(--line); border:1px solid var(--line);
+  grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.card{background:var(--ink-3); padding:24px 22px}
+.card h3{font-size:1.15rem; margin-bottom:10px; color:var(--gold-bright)}
+.card p{margin:0 0 10px; color:var(--mute); font-size:14.5px; font-weight:300}
+.card ul{margin:0; padding-left:18px; color:var(--mute); font-size:14px}
+.card li{margin-bottom:5px}
+
+/* ── contact ─────────────────────────────────────────────────────────────── */
+.contact{background:var(--ink-2)}
+.contact .wrap{display:grid; gap:40px; grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.contact h2{font-size:clamp(1.6rem,3.6vw,2.3rem); margin-bottom:14px}
+.contact p{color:var(--mute); font-weight:300}
+.addr{font-family:'Space Mono',monospace; font-size:13px; color:var(--mute-2); margin-top:22px; line-height:2}
+
+footer{border-top:1px solid var(--line); padding:26px 0; font-size:12.5px; color:var(--mute-2)}
+footer .wrap{display:flex; gap:18px; flex-wrap:wrap; align-items:center}
+footer .mono{margin-left:auto}
+@media (max-width:640px){
+  .hero{padding:56px 0 44px}
+  .notice .live{margin-left:0; flex-basis:100%}
+  footer .mono{margin-left:0}
+}
+</style>
+</head>
+<body>
+
+<div class="notice" role="status">
+  <div class="wrap">
+    <span class="dot" aria-hidden="true"></span>
+    <span><b>Live console temporarily offline.</b> The recognition service is
+      restarting &mdash; it loads its models on boot, which takes about a minute.
+      This page is served from a separate system and stays up throughout.</span>
+    <span class="live mono">AstraGaze &middot; graytechsolutions.dev</span>
+  </div>
+</div>
+
+<header>
+  <div class="wrap">
+    <div>
+      <div class="mark">ASTRA<span>GAZE</span></div>
+      <div class="tag">by Gray Tech Solutions</div>
+    </div>
+    <nav>
+      <a href="#pipeline">Pipeline</a>
+      <a href="#capability">Capability</a>
+      <a href="#constraints">Build constraints</a>
+      <a href="#contact">Contact</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="wrap">
+    <div class="eyebrow">Physical security &middot; Live face recognition</div>
+    <h1>Find the body. <em>Check the face.</em> Attach the name.</h1>
+    <p class="lede">AstraGaze turns a security camera into an identification
+      system. One pipeline, three stages, and a name only ever comes from a
+      reference somebody enrolled &mdash; nobody is guessed at, and nobody is
+      invented.</p>
+    <div class="cta">
+      <a class="btn" href="#contact">Talk to us</a>
+      <a class="btn ghost" href="#pipeline">How it works</a>
+    </div>
+  </div>
+</div>
+
+<section id="pipeline">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="n">01</span>
+      <h2>Three stages, one frame</h2>
+      <p>The camera is an extension of the scene, not a separate mode. Each frame
+        runs all three stages in order, and the reticle on screen carries the
+        verdict as it changes hands.</p>
+    </div>
+    <div class="stages">
+      <div class="stage">
+        <div class="idx">STAGE 1</div>
+        <h3>Find</h3>
+        <p>A person detector runs on the wide scene frame and gates everything
+          after it. Cheap, and it means the expensive models never see a frame
+          with nobody in it.</p>
+        <div class="model">model <b>yolov8n onnxruntime</b></div>
+      </div>
+      <div class="stage">
+        <div class="idx">STAGE 2</div>
+        <h3>Check</h3>
+        <p>A face detector runs inside each person box. Its output is measured
+          against a pixel budget &mdash; face width, inter-ocular distance, and
+          Laplacian sharpness &mdash; so a 14-pixel blur is refused rather than
+          scored.</p>
+        <div class="model">model <b>SCRFD-500M</b></div>
+      </div>
+      <div class="stage">
+        <div class="idx">STAGE 3</div>
+        <h3>Name</h3>
+        <p>The face crop is embedded and compared by cosine similarity against
+          the enrolled gallery. Above the calibrated threshold it gets a name and
+          a confidence; below it, it stays anonymous on purpose.</p>
+        <div class="model">model <b>ArcFace MobileFaceNet</b></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="capability">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="n">02</span>
+      <h2>What is in the box</h2>
+    </div>
+    <table>
+      <caption>Every stage runs on the same CPU-only pipeline. No GPU required.</caption>
+      <thead>
+        <tr><th>Stage</th><th>Model</th><th>Measured</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1 &middot; Find</td><td>YOLO person on a wide frame, gating everything after it</td><td><code>POST /api/persons</code></td><td><span class="pill live">live</span></td></tr>
+        <tr><td>2 &middot; Check</td><td>SCRFD face detection, pixel-budget gated</td><td>face width, IOD, sharpness</td><td><span class="pill live">live</span></td></tr>
+        <tr><td>3 &middot; Name</td><td>ArcFace embedding, cosine against the gallery</td><td>calibrated threshold</td><td><span class="pill live">live</span></td></tr>
+        <tr><td>Tracking</td><td>IoU tracker with NMS, per-session identity space</td><td><code>POST /api/live/frame</code></td><td><span class="pill live">live</span></td></tr>
+        <tr><td>Enrolment</td><td>5&ndash;15 shots averaged into one reference vector</td><td><code>POST /api/enrol</code></td><td><span class="pill live">live</span></td></tr>
+        <tr><td>Pixel budget</td><td>Refuses a face too small or too blurred to trust</td><td>20 / 40 / 80 px bands</td><td><span class="pill live">live</span></td></tr>
+        <tr><td>Calibration</td><td>Operating point set from observed errors, not a default</td><td><code>GET /calibration</code></td><td><span class="pill live">live</span></td></tr>
+        <tr><td>Multi-GPU / TensorRT</td><td>FP-16 tensor-core path</td><td>&mdash;</td><td><span class="pill gate">needs NVIDIA</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="constraints">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="n">03</span>
+      <h2>Build constraints</h2>
+      <p>Stated up front, because a system that claims more than it can do is
+        worse than one that tells you where its edges are.</p>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <h3>Recognition is not identification</h3>
+        <p>AstraGaze answers one question: does this face match a reference
+          somebody enrolled? It does not answer who a stranger is, and a name
+          only ever appears from the gallery.</p>
+        <ul>
+          <li>No faces are enrolled from camera footage automatically</li>
+          <li>A name is never inferred from a name-like string</li>
+          <li>Below-threshold faces stay anonymous, by design</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Accuracy depends on the reference</h3>
+        <p>A gallery entry is one averaged vector built from 5&ndash;15 shots.
+          The rig spec is explicit that one LinkedIn headshot will fail from the
+          air, and our own audit agrees.</p>
+        <ul>
+          <li>Frontal, &plusmn;30&deg; yaw, slight down-pitch, sunglasses on/off</li>
+          <li>Thin identities are flagged rather than hidden</li>
+          <li>The threshold is reported with its measured error rates</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Consent and retention</h3>
+        <p>Enrolment is an explicit act by a named operator. The live path stores
+          no video, no frames, and no new identities.</p>
+        <ul>
+          <li>Nothing is written by a camera frame</li>
+          <li>Event logs hold names and timings, not images</li>
+          <li>Deployments in the US need a documented retention policy</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Hardware</h3>
+        <p>The whole pipeline runs CPU-only today, which keeps the hardware
+          requirement to a standard server or a workstation.</p>
+        <ul>
+          <li>onnxruntime, CPU execution provider</li>
+          <li>~70&thinsp;s cold start while models load</li>
+          <li>TensorRT FP-16 available on NVIDIA hardware</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="contact" class="contact">
+  <div class="wrap">
+    <div>
+      <h2>See it on your own camera</h2>
+      <p>The live console runs in a browser and reads a camera you choose. We
+        will set up a session on a scene you control, and you can watch the
+        three stages resolve frame by frame.</p>
+      <p style="margin-top:20px"><a class="btn" href="mailto:hello@graytechsolutions.dev">Get in touch</a></p>
+    </div>
+    <div>
+      <h3 class="cond" style="font-size:1.3rem;margin-bottom:6px">Gray Tech Solutions</h3>
+      <div class="addr">
+        AstraGaze face recognition<br>
+        graytechsolutions.dev<br>
+        graytech.mobilemonero.com<br><br>
+        <span class="mono">hello@graytechsolutions.dev</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>AstraGaze by Gray Tech Solutions</span>
+    <span class="mono">this page is served independently of the recognition service</span>
+  </div>
+</footer>
+
+</body>
+</html>
