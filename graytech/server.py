@@ -1050,11 +1050,26 @@ async def enrol(name: str = Query(...),
     return {"ok": True, "name": display, "key": key,
             "updated_existing": existed, "enrolled": len(vecs),
             "rejected": rejected, "spread": round(spread, 4),
-            "shot_quality": "thin" if len(vecs) < 5 else "ok",
-            "shot_note": ("fewer than 5 shots - this will be the weakest identity in "
-                          "the gallery and may be refused from a webcam"
-                          if len(vecs) < 5 else ""),
+            # A batch is either a first enrolment or an addition. Whether the
+            # resulting IDENTITY is thin is a different question, answered by
+            # identities_after below from the total on record.
+            "batch_size": len(vecs),
+            "is_first_enrolment": not existed,
             "similar_to": sorted(dupes, key=lambda d: -d["cosine"])[:3],
+            # What this identity looks like AFTER the write, so a caller can warn
+            # about the identity rather than about this batch.
+            #
+            # Reporting only the batch is what produced a warning that was both
+            # always-on and wrong: four good photographs added to Cory Gray, who
+            # already had four on record, came back as "fewer than 5 shots - this
+            # will be the weakest identity in the gallery" while the panel beside
+            # it showed him at eight and unflagged. The two disagreed, and the
+            # alarming one was the false one.
+            "identities_after": (lambda s: {
+                "shots": s,
+                "quality": "thin" if s < 5 else "ok",
+                "short_by": max(0, 5 - s),
+            })(int((_read_provenance().get(key) or {}).get("shots", len(vecs)))),
             "identities": len(recogniser.names)}
 
 
@@ -1747,6 +1762,47 @@ footer{border-top:1px solid var(--line);margin-top:40px;padding-top:22px;
   <div id="calProfiles" class="note" style="margin-top:6px"></div>
 </div>
 
+<div class="card" style="margin-top:14px" id="enrolCard">
+  <div class="cardhead">
+    <div><span class="eyebrow">Gallery</span><h2>Enrol a face</h2></div>
+    <span id="enrolCount" class="badge sim">—</span>
+  </div>
+  <div class="note" style="margin-top:6px">
+    Upload photographs of a person and they become an identity the system can
+    name. <b>Five to fifteen shots</b> — frontal, &plusmn;30&deg; yaw, slight
+    down-pitch, sunglasses on and off — is the difference between being
+    recognised from a camera and being refused. They are averaged into one
+    reference vector; the count beside each name below is how many shots went
+    into it, and anything under five is marked <span style="color:var(--amb)">thin</span>
+    because that identity will struggle.
+  </div>
+  <div style="display:flex; gap:12px; margin-top:14px; flex-wrap:wrap; align-items:flex-end">
+    <div style="flex:1 1 220px; min-width:180px">
+      <div class="note" style="margin:0 0 5px">Name</div>
+      <input id="enrolName" type="text" placeholder="e.g. Cory Gray"
+             autocomplete="off" spellcheck="false"
+             style="width:100%; padding:10px 12px; background:var(--bg);
+                    border:1px solid var(--line-2); color:var(--txt);
+                    font-family:'Saira Condensed',sans-serif; font-size:16px">
+    </div>
+    <div style="flex:2 1 320px; min-width:240px">
+      <div class="note" style="margin:0 0 5px">Photographs</div>
+      <input id="enrolFiles" type="file" accept="image/*" multiple
+             style="width:100%; font-size:14px; color:var(--mut)">
+    </div>
+    <button id="enrolBtn" onclick="doEnrol()">Enrol</button>
+  </div>
+  <div id="enrolStatus" class="note" style="margin-top:12px"></div>
+  <div id="enrolShotList" class="note" style="margin-top:8px"></div>
+  <div style="margin-top:16px; border-top:1px solid var(--line); padding-top:14px">
+    <div class="note" style="margin:0 0 10px">
+      <b id="enrolTotal">—</b> identities enrolled. Sorted by weakest first, because
+      that is the list worth acting on.
+    </div>
+    <div id="enrolList" style="display:flex; flex-wrap:wrap; gap:6px"></div>
+  </div>
+</div>
+
 <div class="card" style="margin-top:14px" id="aboutCard">
   <div class="cardhead"><div><span class="eyebrow">Scope</span><h2>About this demo</h2></div></div>
   <p class="note" style="margin-top:0">
@@ -2398,6 +2454,155 @@ function drawCalibration(c){
     : '<span style="color:var(--mut)">No adaptive corrections recorded yet. Correcting a misidentification enriches that person\'s profile immediately, without retraining the network.</span>';
 }
 
+// ── Enrolment ───────────────────────────────────────────────────────────────
+//
+// This panel is the reason /api/enrol is reachable at all. The endpoint worked -
+// it is mounted, tested, and blends into existing profiles - and for a while
+// that was the whole of the feature: a working route no page called, which by
+// this repo's own standard is not a feature. Adding a face meant running a
+// script by hand on one machine.
+//
+// Every verdict is shown, including the unpromising ones. A silent success that
+// enrolled nothing is the failure mode worth designing against, so a rejected
+// photograph is named and explained rather than dropped.
+//
+// It will not manufacture shots. If you upload one photograph, it says the
+// identity is thin and that it will struggle from a camera - because averaging
+// fourteen copies of one image raises the self-similarity and teaches the system
+// nothing about variation. Saying so here is cheaper than discovering it from a
+// recognition failure later.
+function esc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+let enrolBusy=false;
+
+async function drawEnrolment(){
+  let d;
+  try{
+    const r=await fetch('/api/identities',{cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    d=await r.json();
+  }catch(e){
+    document.getElementById('enrolCount').textContent='unavailable';
+    document.getElementById('enrolStatus').innerHTML=
+      '<span style="color:var(--red)">Could not read the gallery: '+esc(e.message)+
+      ' — is the recognition model still loading?</span>';
+    return;
+  }
+
+  const list=d.identities||[];
+  document.getElementById('enrolCount').textContent =
+    d.count+' enrolled'+(d.thin?' · '+d.thin+' thin':'');
+  document.getElementById('enrolTotal').textContent=d.count;
+
+  // Weakest first. A gallery list in alphabetical order hides the two identities
+  // that will actually be refused, which is the only reason to look at it.
+  const sorted=list.slice().sort((a,b)=>{
+    const av=a.quality==='ok'?2:(a.quality==='thin'?0:1);
+    const bv=b.quality==='ok'?2:(b.quality==='thin'?0:1);
+    return av-bv || (a.shots||0)-(b.shots||0);
+  });
+
+  document.getElementById('enrolList').innerHTML = sorted.map(x=>{
+    const col = x.quality==='ok'?'var(--grn)':(x.quality==='thin'?'var(--amb)':'var(--mute)');
+    const shots = x.shots==null?'?':x.shots;
+    return '<span title="'+esc(x.name)+' — '+shots+' shot(s), '+esc(x.quality)+
+      '" style="border:1px solid '+col+';color:'+col+';padding:3px 9px;'+
+      'border-radius:2px;font-size:12.5px;font-family:\'Space Mono\',monospace'+
+      '">'+esc((x.name||'').replace(/_/g,' '))+
+      ' <b>'+shots+'</b></span>';
+  }).join('');
+}
+
+async function doEnrol(){
+  if(enrolBusy) return;
+  const name=(document.getElementById('enrolName').value||'').trim();
+  const input=document.getElementById('enrolFiles');
+  const files=input.files;
+  const status=document.getElementById('enrolStatus');
+  const btn=document.getElementById('enrolBtn');
+
+  if(!name){
+    status.innerHTML='<span style="color:var(--amb)">Give a name first — it is '+
+      'the only thing that attaches to these vectors. Nothing is invented.</span>';
+    return;
+  }
+  if(!files || !files.length){
+    status.innerHTML='<span style="color:var(--amb)">Choose at least one photograph.</span>';
+    return;
+  }
+
+  enrolBusy=true;
+  btn.disabled=true;
+  btn.textContent='Enrolling…';
+  status.innerHTML='<span style="color:var(--mut)">Embedding '+(files.length)+
+    ' photograph(s) — each one is a separate model pass, so this takes a few seconds.</span>';
+
+  try{
+    const fd=new FormData();
+    for(const f of files) fd.append('files', f, f.name);
+    const r=await fetch('/api/enrol?name='+encodeURIComponent(name),
+                        {method:'POST', body:fd});
+    const j=await r.json();
+
+    if(!r.ok || j.ok===false){
+      let m='<span style="color:var(--red)"><b>Nothing was enrolled.</b> '+
+            esc(j.detail||j.reason||('HTTP '+r.status))+'</span>';
+      if(j.rejected && j.rejected.length){
+        m+='<ul style="margin:8px 0 0 18px">'+j.rejected.map(x=>
+          '<li>'+esc(x.file)+' — '+esc(x.why)+'</li>').join('')+'</ul>';
+      }
+      status.innerHTML=m;
+      return;
+    }
+
+    let m='<span style="color:var(--grn)"><b>'+esc(j.name)+' enrolled</b> from '+
+      j.enrolled+' shot(s)'+(j.updated_existing?' (blended into the existing profile)':'')+
+      '.</span>';
+    if(j.spread!=null){
+      m+=' <span style="color:var(--mut)">Shot spread '+Number(j.spread).toFixed(3)+
+         (j.spread<0.08?' — that is low, so these photographs are close to copies of '+
+          'each other. Different angles would help far more than more copies.'
+          :' — the shots differ enough to be averaging into a useful reference.')+'</span>';
+    }
+    // Warn about the identity, not about this upload. A good batch added to a thin
+    // identity should still be flagged; a good batch added to a healthy one
+    // should not. That is the server's call because only it knows the total.
+    const after=j.identities_after;
+    if(after && after.quality==='thin'){
+      m+='<br><span style="color:var(--amb)">This identity is at <b>'+after.shots+
+         '</b> of the 5 shots it wants'+
+         (after.short_by?' — add '+after.short_by+' more, or it may be refused from '+
+          'a webcam':'')+'.</span>';
+    }
+    if(j.similar_to && j.similar_to.length){
+      m+='<br><span style="color:var(--amb)">This face closely resembles '+
+        j.similar_to.map(d=>esc(d.name.replace(/_/g,' '))+' ('+d.cosine+')').join(', ')+
+        '. If that is the same person, add these shots to their name instead — '+
+        'two identities for one person will each match only their own photographs.</span>';
+    }
+    if(j.rejected && j.rejected.length){
+      m+='<ul style="margin:8px 0 0 18px;color:var(--mut)">'+
+        '<li>not used: '+j.rejected.length+' file(s)</li>'+
+        j.rejected.slice(0,6).map(x=>'<li>'+esc(x.file)+' — '+esc(x.why)+'</li>').join('')+
+        '</ul>';
+    }
+    status.innerHTML=m;
+
+    document.getElementById('enrolName').value='';
+    input.value='';
+    await drawEnrolment();
+  }catch(e){
+    status.innerHTML='<span style="color:var(--red)">Request failed: '+
+      esc(e.message)+'. If the file is large, try fewer photographs at once.</span>';
+  }finally{
+    enrolBusy=false;
+    btn.disabled=false;
+    btn.textContent='Enrol';
+  }
+}
+
 // ── Live camera + stage 1 overlay ──────────────────────────────────────────
 // The browser owns the camera, so the viewer picks their own device and the
 // server never has to guess what is plugged in. Nothing here starts on its own:
@@ -3004,6 +3209,10 @@ document.addEventListener('keydown',e=>{
 
 window.addEventListener('resize',()=>{ if(camStream||stillMode) hudSize(); });
 if(navigator.mediaDevices&&navigator.mediaDevices.enumerateDevices) listCams();
+// Populate the enrolment panel on load so the gallery is visible without a click.
+// It reads /api/identities once - cheap, no model work - and reports "unavailable"
+// rather than throwing if the recogniser is still booting.
+drawEnrolment();
 // Size the overlay up front. It used to default to the 300x150 canvas size and
 // only be corrected when the camera started, so the overlay was drawn into a
 // buffer a quarter of the display size and then stretched by CSS.

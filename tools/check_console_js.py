@@ -19,6 +19,7 @@ entry points catches this class without a browser.
 from __future__ import annotations
 
 import io
+import json
 import re
 import subprocess
 import sys
@@ -59,8 +60,25 @@ const ctx2d = {
   fillStyle: '', strokeStyle: '', lineWidth: 1, font: '', globalAlpha: 1, textAlign: '',
 };
 const store = {};
+// Ids the page actually declares, read out of the same HTML rather than
+// hardcoded here.
+//
+// getElementById used to fabricate an element for any id at all, which is how a
+// misspelled id passed: the panel asked for 'enrolCountTYPO', received a fake
+// element, wrote .textContent into the void, and the harness reported OK. A stub
+// that invents whatever it is asked for cannot detect the most ordinary bug in a
+// page.
+//
+// The list is injected from the extracted HTML at runtime, so adding an element
+// to the page needs no edit here and a typo in the script is a thrown error.
+const DECLARED_IDS = new Set(__pageIds);
 const document = {
-  getElementById: (id) => (store[id] ||= mkEl(id)),
+  getElementById: (id) => {
+    if (!DECLARED_IDS.has(id)) {
+      throw new Error('getElementById: no element with id "' + id + '" is declared in the page');
+    }
+    return (store[id] ||= mkEl(id));
+  },
   querySelector: (sel) => mkEl(sel),
   querySelectorAll: () => [],
   createElement: (t) => mkEl('', t),
@@ -103,7 +121,18 @@ const Blob = function () {};
 const URL = { createObjectURL: () => 'blob:x', revokeObjectURL: noop };
 const Image = function () { this.src = ''; };
 Image.prototype.decode = () => Promise.resolve();
-const fetch = () => Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}), text: () => Promise.resolve('') });
+// Lets a test case say "the next fetch returns this" - the enrolment panel is a
+// fetch-driven panel, and a stub that always 404s would only ever exercise its
+// failure branch.
+var __fetchQueue = [];
+const fetch = (url) => {
+  if (__fetchQueue.length) {
+    const r = __fetchQueue.shift();
+    return Promise.resolve(typeof r === 'function' ? r(url) : r);
+  }
+  return Promise.resolve({ ok: false, status: 404,
+                           json: () => Promise.resolve({}), text: () => Promise.resolve('') });
+};
 const setInterval = () => 0, clearInterval = noop;
 const setTimeout = () => 0, clearTimeout = noop;
 const requestAnimationFrame = noop;
@@ -115,7 +144,7 @@ const console = {
   log: noop, warn: noop, info: noop, debug: noop,
   error: (...a) => { process.stderr.write('[console.error] ' + a.join(' ') + '\n'); },
 };
-globalThis.addEventListener = noop;
+var __addEventListener = noop;
 """
 
 
@@ -128,11 +157,18 @@ def main() -> int:
     html = m.group(1)
     js = html[html.index("<script>") + 8: html.rindex("</script>")]
 
+    # Every id the page declares, handed to the harness so its getElementById
+    # can reject an id that is not there. Derived from this same HTML rather than
+    # a list maintained by hand, so the two cannot drift.
+    page_ids = sorted(set(re.findall(r'id="([A-Za-z0-9_-]+)"', html)))
+    prelude = "const __pageIds = " + json.dumps(page_ids) + ";\n"
+
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "hud.js"
         # Wrap so top-level statements actually execute and any throw is caught.
         p.write_text(
-            HARNESS
+            prelude
+            + HARNESS
             + "\n;(async () => {\n"
             + js
             + "\n})().then(() => {\n"
@@ -171,7 +207,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         p2 = Path(td) / "frame.js"
         p2.write_text(
-            HARNESS
+            prelude
+            + HARNESS
             + "\n;(async () => {\n" + js + "\n"
             + "  const shapes = " + __import__("json").dumps(shapes) + ";\n"
             + "  for (const [k, d] of Object.entries(shapes)) {\n"
@@ -193,6 +230,41 @@ def main() -> int:
             + "  catch (e) { process.stderr.write('STAGES: ' + e.name + ': ' + e.message + '\\n'); }\n"
             + "  try { drawLog([{t:1,kind:'scan',name:'x',detected:true,matched:true,confidence:0.9}]); }"
             + "  catch (e) { process.stderr.write('LOG: ' + e.name + ': ' + e.message + '\\n'); }\n"
+            + "  // The enrolment panel. It is fetch-driven and its whole job is to\n"
+            + "  // render a server verdict, so both branches are exercised with a\n"
+            + "  // queued response: the healthy gallery, and the failure message.\n"
+            + "  // Without this the panel is untested, which is how a panel whose only\n"
+            + "  // job is reporting can ship throwing on every load.\n"
+            + "  const gallery = {count:3, thin:1, unknown:0, identities:[\n"
+            + "    {name:'Brad_Pitt', shots:15, quality:'ok'},\n"
+            + "    {name:'Joe_Lee', shots:3, quality:'thin'},\n"
+            + "    {name:'NoSidecar', shots:null, quality:'unknown'}]};\n"
+            + "  __fetchQueue.push({ok:true, status:200, json:()=>Promise.resolve(gallery)});\n"
+            + "  try { await drawEnrolment(); }"
+            + "  catch (e) { process.stderr.write('ENROL-LIST: ' + e.name + ': ' + e.message + '\\n'); }\n"
+            + "  const el = document.getElementById('enrolList');\n"
+            + "  if (!el || !el.innerHTML || el.innerHTML.indexOf('Brad') < 0)\n"
+            + "    process.stderr.write('ENROL-RENDER: the gallery did not render any identity\\n');\n"
+            + "  __fetchQueue.push({ok:false, status:500, json:()=>Promise.resolve({})});\n"
+            + "  try { await drawEnrolment(); }"
+            + "  catch (e) { process.stderr.write('ENROL-FAIL: ' + e.name + ': ' + e.message + '\\n'); }\n"
+            + "  const cs = document.getElementById('enrolStatus');\n"
+            + "  if (cs && cs.innerHTML && cs.innerHTML.indexOf('Could not read') < 0)\n"
+            + "    process.stderr.write('ENROL-FAILMSG: a failed read did not say so\\n');\n"
+            + "  // doEnrol() guard clauses: no name, and a name with no file. Neither may\n"
+            + "  // reach the network, and both must say what is missing.\n"
+            + "  for (const [label, fname, files] of [\n"
+            + "        ['no-name', '', [{name:'a.jpg'}]],\n"
+            + "        ['no-file', 'Someone', []]]) {\n"
+            + "    document.getElementById('enrolName').value = fname;\n"
+            + "    document.getElementById('enrolFiles').files = files;\n"
+            + "    try { await doEnrol(); }"
+            + "    catch (e) { process.stderr.write('DOENROL[' + label + ']: ' + e.name + ': ' + e.message + '\\n'); }\n"
+            + "    const st = document.getElementById('enrolStatus');\n"
+            + "    if (st && st.innerHTML && st.innerHTML.indexOf('Give a name') < 0 &&\n"
+            + "        st.innerHTML.indexOf('Choose at least one') < 0)\n"
+            + "      process.stderr.write('DOENROL[' + label + ']: refused without saying why\\n');\n"
+            + "  }\n"
             + "})().catch(e => { process.stderr.write('TOPLEVEL: ' + e.name + ': ' + e.message + '\\n'); });\n",
             encoding="utf-8")
         r2 = subprocess.run(["node", str(p2)], capture_output=True, text=True, timeout=60)
