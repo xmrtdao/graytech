@@ -143,17 +143,78 @@ def main() -> int:
             encoding="utf-8")
         r = subprocess.run(["node", str(p)], capture_output=True, text=True, timeout=60)
 
+    # Exercise the per-frame overlay path too. A temporal-dead-zone read inside
+    # drawOverlay() - "Cannot access 'onFace' before initialization" - only
+    # throws once a frame is actually drawn, so checking init alone is not enough.
+    # Two shapes: a person with a face (named), and one without.
+    shapes = {
+        "named": {
+            "frame": {"w": 720, "h": 1280},
+            "persons": [{"box": [100, 200, 400, 1100], "conf": 0.9, "norm": [0.14, 0.16, 0.55, 0.86]}],
+            "tracks": [{"id": 1, "box": [100, 200, 400, 1100], "conf": 0.9, "hits": 4, "age_s": 2}],
+            "identify": {"ran": True, "named": 1, "gated": 0, "gallery": 33, "face_ms": 40,
+                         "people": [{"box": [100, 200, 400, 1100], "stage": "named", "name": "Joe_Lee",
+                                     "cosine": 0.99, "conf": 0.9,
+                                     "face": {"bbox": [200, 220, 300, 330], "face_px": 100,
+                                              "band": "robust"}}]},
+            "count": 1, "track_count": 1, "ok": True, "conf": 0.25, "ms": 100, "find_ms": 90,
+        },
+        "noface": {
+            "frame": {"w": 720, "h": 1280},
+            "persons": [{"box": [10, 20, 300, 900], "conf": 0.4, "norm": [0.01, 0.02, 0.42, 0.70]}],
+            "tracks": [{"id": 2, "box": [10, 20, 300, 900], "conf": 0.4, "hits": 1, "age_s": 1}],
+            "identify": {"ran": True, "named": 0, "gated": 0, "gallery": 33, "face_ms": 30,
+                         "people": [{"box": [10, 20, 300, 900], "stage": "found", "note": "no face"}]},
+            "count": 1, "track_count": 1, "ok": True, "conf": 0.25, "ms": 120, "find_ms": 95,
+        },
+    }
+    with tempfile.TemporaryDirectory() as td:
+        p2 = Path(td) / "frame.js"
+        p2.write_text(
+            HARNESS
+            + "\n;(async () => {\n" + js + "\n"
+            + "  const shapes = " + __import__("json").dumps(shapes) + ";\n"
+            + "  for (const [k, d] of Object.entries(shapes)) {\n"
+            + "    try { drawOverlay(d, false); }"
+            + "    catch (e) { process.stderr.write('OVERLAY[' + k + ']: ' + e.name + ': ' + e.message + '\\n'); }\n"
+            + "    try { drawOverlay(d, true); }"
+            + "    catch (e) { process.stderr.write('OVERLAY-STILL[' + k + ']: ' + e.name + ': ' + e.message + '\\n'); }\n"
+            + "  }\n"
+            + "  const st = Object.assign({}, shapes.named, {\n"
+            + "    present: [], stats: { identified: 5, unknown: 1, entered: 9, exited: 4 },\n"
+            + "    in_frame: 2, tracked: 2, edge: 0, scan_ms: 42, uptime: 300,\n"
+            + "    pixel: { observed_median: 150, iod_median: 62, spec: { detect_px: 20 } },\n"
+            + "    person: { live_frames: 10, live_detections: 9, tracks: [] },\n"
+            + "    calibration: { recommend: {}, profiles: {} },\n"
+            + "  });\n"
+            + "  try { drawKpis(st); }"
+            + "  catch (e) { process.stderr.write('KPIS: ' + e.name + ': ' + e.message + '\\n'); }\n"
+            + "  try { drawStages(st); }"
+            + "  catch (e) { process.stderr.write('STAGES: ' + e.name + ': ' + e.message + '\\n'); }\n"
+            + "  try { drawLog([{t:1,kind:'scan',name:'x',detected:true,matched:true,confidence:0.9}]); }"
+            + "  catch (e) { process.stderr.write('LOG: ' + e.name + ': ' + e.message + '\\n'); }\n"
+            + "})().catch(e => { process.stderr.write('TOPLEVEL: ' + e.name + ': ' + e.message + '\\n'); });\n",
+            encoding="utf-8")
+        r2 = subprocess.run(["node", str(p2)], capture_output=True, text=True, timeout=60)
+
+    out2 = ((r2.stderr or "") + (r2.stdout or "")).strip()
+    if r2.returncode != 0 or any(m in out2 for m in ("TOPLEVEL:", "HUDSIZE:", "OVERLAY", "KPIS:", "STAGES:", "LOG:")):
+        print("HARNESS FAILED - the per-frame path threw:")
+        print(out2[:2500] if out2 else f"(exit {r2.returncode}, no output)")
+        return 1
+
     out = ((r.stderr or "") + (r.stdout or "")).strip()
-    # Any marker means the script threw. The exit code alone is not enough
-    # because an async rejection escapes the process with status 0.
-    if r.returncode != 0 or "TOPLEVEL:" in out or "HUDSIZE:" in out or "ReferenceError" in out:
+    if r.returncode != 0 or any(m in out for m in ("TOPLEVEL:", "HUDSIZE:")):
         print("HARNESS FAILED - the script threw at load:")
         print(out[:2000] if out else f"(exit {r.returncode}, no output)")
         return 1
 
-    print("HARNESS OK - script initialises, and hudSize() runs, without a runtime error")
-    print("  catches ReferenceError in top-level code and in the init path,")
-    print("  which node --check cannot see")
+    print("HARNESS OK")
+    print("  - script initialises and hudSize() runs")
+    print("  - drawOverlay() runs for a named person and for one with no face")
+    print("  - drawKpis/drawStages/drawLog run")
+    print("  catches ReferenceError and temporal-dead-zone reads that")
+    print("  node --check cannot see")
     return 0
 
 

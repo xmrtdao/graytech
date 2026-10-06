@@ -30,8 +30,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import random
+import re
 import subprocess
 import tempfile
 import threading
@@ -55,6 +57,11 @@ from app import IDENTITY_DIR, face as recogniser
 from app.personfind import Tracker, personfinder
 
 DATASET_DEFAULT = r"C:\Users\PureTrek\Desktop\Faces\Faces"
+
+# This module logs to stderr, which the supervisor redirects to logs/graytech.log
+# alongside uvicorn's own output. Kept as a named logger rather than print() so
+# the gallery/model mismatch lands in the same stream an operator already reads.
+log = logging.getLogger("graytech")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 SCENE_W, SCENE_H = 960, 540
@@ -676,6 +683,393 @@ def persons_status() -> dict:
             "conf_thresh": personfinder.conf}
 
 
+# ── Enrolment ────────────────────────────────────────────────────────────────
+#
+# This did not exist, and its absence is why the gallery could only ever hold
+# the 33 identities somebody had run a script to add. The recogniser could
+# register an identity and the adaptive learner could enrich one, but neither
+# app/'s routes nor calibrator's were mounted on this app, so there was no
+# endpoint and no page control that could put a new person into the gallery.
+#
+# The failure that prompted it was concrete. Joe_Lee and Cory_Gray were each
+# enrolled from ONE photograph while the other 31 identities were averaged from
+# fifteen. A prototype built from a single image cannot cover the sensor, lens,
+# colour-temperature and resolution differences a webcam introduces, so its
+# owner was refused by his own gallery. The fix is more shots of the real person,
+# so shots are what you can now supply - from the browser, not a script.
+#
+# What is deliberately NOT here:
+#   * No guessing who an upload is. If a face already has an identity, the shot
+#     is reported as a near-duplicate of that name rather than silently creating
+#     a second identity for the same person.
+#   * No synthesising extra shots from the one photo you have. Averaging 14
+#     copies of a single image raises self-similarity and proves nothing about
+#     recognition - it is the same photograph counted fourteen times.
+#   * No inventing. A shot with no detectable face, or one too small to be a
+#     trustworthy reference, is named and discarded, never substituted.
+
+ENROL_MIN_FACE_PX = 60      # below this a "reference" is mostly JPEG artefacts
+ENROL_MAX_BYTES = 12 * 1024 * 1024
+ENROL_DUPE_COS = 0.60       # at/above this, call it the same person out loud
+
+# Where each identity's SHOT COUNT is recorded, and why that is its own file.
+#
+# A gallery entry is one averaged 512-d vector. Fifteen shots go in and the count
+# is not recoverable from the output - so the first version of /api/identities
+# reported every identity as shots=1, because a .npy with no sidecar looks
+# identical whether it was built from one photo or fifteen. That reported 31
+# healthy fifteen-shot identities as thin, which is the wrong answer in the
+# direction that matters: it hides which identities really are single-shot.
+#
+# So the count is written alongside the vector from now on, and anything with no
+# sidecar reports quality "unknown" rather than a fabricated number. An identity
+# whose provenance we cannot state is a thing to be curious about, not to
+# silently round down to 1.
+_PROVENANCE = IDENTITY_DIR / "_provenance.json"
+_prov_lock = threading.Lock()
+
+
+# Which recognition network produced each vector in the gallery.
+#
+# FACE_MODEL_PACK has always been a config knob, which made switching the
+# backbone look like a one-line change. It is not, and the reason is invisible
+# from the file itself: every .npy is 512-d no matter which net wrote it.
+#
+#   buffalo_s -> w600k_mbf   (MobileFaceNet)
+#   buffalo_l -> w600k_r50   (ResNet-50/100)
+#
+# A cosine between those two is not a low score, it is a meaningless one. Set
+# FACE_MODEL_PACK=buffalo_l against a buffalo_s gallery and every identity loads,
+# every match runs, every cosine looks plausible, and every name is wrong - with
+# nothing anywhere reporting a problem. That is the specific shape of failure
+# worth a guard: not an error, an answer.
+#
+# So the pack is recorded on every enrolment, and startup refuses to serve a
+# gallery that was not built by the loaded model rather than quietly mismatching.
+_PACK_OF_PACK = {
+    "buffalo_s": "w600k_mbf",
+    "buffalo_m": "w600k_mbf",
+    "buffalo_sc": "w600k_mbf",
+    "buffalo_l": "w600k_r50",
+    "antelopev2": "glintr100",
+}
+_GALLERY_MISMATCH: list[dict] = []
+
+
+def _gallery_pack_report() -> dict:
+    """
+    Compare the loaded pack against the recorded provenance of every vector.
+
+    Returns a report and records any mismatch in _GALLERY_MISMATCH so /health can
+    surface it. Does not raise: the caller decides whether to refuse to serve,
+    because a diagnostic endpoint should still answer while the operator is
+    looking at the diagnostic.
+    """
+    prov = _read_provenance()
+    want_rec = _PACK_OF_PACK.get(faceapp.MODEL_PACK, faceapp.MODEL_PACK)
+    counts: dict[str, int] = {}
+    unknown = 0
+    for name in getattr(recogniser, "names", []):
+        rec = prov.get(name) or {}
+        rec_net = rec.get("recognition_net")
+        if rec_net:
+            counts[rec_net] = counts.get(rec_net, 0) + 1
+        else:
+            # Enrolled before the sidecar recorded a net. Attribute to the service
+            # default rather than treating it as unknown - it was almost certainly
+            # buffalo_s, and calling it "unknown" would flag a healthy gallery.
+            default_net = _PACK_OF_PACK["buffalo_s"]
+            counts[default_net] = counts.get(default_net, 0) + 1
+            unknown += 1
+    mismatched = {k: v for k, v in counts.items() if k != want_rec}
+    report = {
+        "model_pack": faceapp.MODEL_PACK,
+        "recognition_net": want_rec,
+        "gallery_by_net": counts,
+        "gallery_without_recorded_net": unknown,
+        "mismatched": mismatched,
+        "ok": not mismatched,
+    }
+    _GALLERY_MISMATCH[:] = [{"net": k, "count": v} for k, v in mismatched.items()]
+    if mismatched:
+        log.error("GALLERY/MODEL MISMATCH: serving %s but %s of the gallery was "
+                  "built by another network - every name would be wrong. Re-enrol "
+                  "with tools/_enrol.py before trusting any result.",
+                  faceapp.MODEL_PACK,
+                  ", ".join(f"{v} by {k}" for k, v in mismatched.items()))
+    return report
+
+
+def _read_provenance() -> dict:
+    # Read WITHOUT taking _prov_lock.
+    #
+    # This used to take the lock, and _write_provenance calls it while already
+    # holding it. threading.Lock is not reentrant, so every enrolment deadlocked
+    # here - AFTER np.save(dest, ref) had already written the new vector.
+    #
+    # The result was the worst shape of partial success: the gallery genuinely
+    # changed, the shot count genuinely did not, and nothing raised anywhere.
+    # Joe_Lee silently stayed at shots=1 while carrying a 3-photo blend, which is
+    # the wrong kind of wrong - the identity behaves correctly and the record
+    # lies about it, so nothing surfaces the problem.
+    #
+    # An unsynchronised read is safe here: write_text replaces the file, so a
+    # reader sees either the old bytes or the new ones. The lock only needs to
+    # serialise writers, which is what it is for.
+    try:
+        return json.loads(_PROVENANCE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_provenance(key: str, entry: dict) -> None:
+    with _prov_lock:
+        prov = _read_provenance()
+        prev = prov.get(key) or {}
+        shots = int(prev.get("shots", 0)) + int(entry.get("shots", 0))
+        prov[key] = {
+            "shots": shots,
+            "batches": int(prev.get("batches", 0)) + 1,
+            "first": prev.get("first", time.time()),
+            "last": time.time(),
+            "note": entry.get("note", ""),
+            # Which embedding network wrote this vector. Without it, switching
+            # FACE_MODEL_PACK cannot be detected - see _gallery_pack_report.
+            "model_pack": faceapp.MODEL_PACK,
+            "recognition_net": _PACK_OF_PACK.get(faceapp.MODEL_PACK,
+                                                 faceapp.MODEL_PACK),
+        }
+        _PROVENANCE.parent.mkdir(parents=True, exist_ok=True)
+        _PROVENANCE.write_text(json.dumps(prov, indent=2, sort_keys=True),
+                               encoding="utf-8")
+
+
+def _safe_identity(raw: str) -> tuple[str, str]:
+    """
+    A gallery key that is safe as a filename, and the name to display.
+
+    Case-insensitively resolves to an ALREADY-ENROLLED identity rather than
+    creating a second one. This matters more than it looks: the gallery is
+    case-sensitive, and the natural spelling of an existing identity and the
+    natural typing of the same person are not always the same string. The
+    dataset has 'cory-gray.jpg' and the enrolled key is 'Cory_Gray' - so
+    enrolling that person again under the name that matches their filename
+    would write 'cory_gray.npy' beside 'Cory_Gray.npy', and the console would
+    then announce whichever won the race, intermittently, as two different
+    people. A duplicate identity for one person is the specific failure this
+    whole endpoint exists to make hard to commit, so it is not left to a
+    capital letter.
+    """
+    display = re.sub(r"\s+", " ", str(raw or "")).strip()
+    if not display:
+        raise HTTPException(400, "a name is required")
+    if len(display) > 64:
+        raise HTTPException(400, "name is longer than 64 characters")
+    if re.search(r"[^\w .-]", display):
+        raise HTTPException(
+            400, "name may only contain letters, numbers, spaces, dots and dashes")
+    key = re.sub(r"[^A-Za-z0-9_]", "_", display)
+    if not key or key.startswith("."):
+        raise HTTPException(400, "name does not reduce to a usable identifier")
+
+    for existing in recogniser.names:
+        if existing.lower() == key.lower():
+            # Keep the enrolled spelling; the typed one becomes the display name.
+            return existing, display
+    return key, display
+
+
+@application.get("/api/identities")
+def identities_list() -> dict:
+    """
+    Who is enrolled, and how many shots each identity is actually built from.
+
+    The bare count is misleading and that is why this exists. 2,564 photographs
+    in the source dataset are 33 PEOPLE, not 2,564 subjects, and an identity can
+    be a single shot while its neighbour is fifteen. The thin ones are the weak
+    ones, so the shot count travels with the name instead of being something you
+    have to already know.
+    """
+    prov = _read_provenance()
+    out = []
+    for n in sorted(recogniser.names):
+        path = IDENTITY_DIR / f"{n}.npy"
+        rec = prov.get(n)
+        if rec:
+            shots: Optional[int] = int(rec.get("shots", 0))
+            quality = "thin" if shots < 5 else "ok"
+        else:
+            # No record of how many shots this was built from. Say so rather
+            # than assuming one - an identity whose provenance is unknown is not
+            # the same claim as an identity known to be single-shot.
+            shots, quality = None, "unknown"
+        try:
+            from app.calibration import calibrator
+            learned = len(calibrator.profiles.get(n, []))
+        except Exception:                                   # noqa: BLE001
+            learned = 0
+        out.append({"name": n, "shots": shots, "learned": learned,
+                    "quality": quality,
+                    "modified": path.stat().st_mtime if path.exists() else None})
+    thin = sum(1 for r in out if r["quality"] == "thin")
+    unknown = sum(1 for r in out if r["quality"] == "unknown")
+    return {"count": len(out), "identities": out, "thin": thin,
+            "unknown": unknown, "dir": str(IDENTITY_DIR)}
+
+
+@application.post("/api/enrol")
+async def enrol(name: str = Query(...),
+                files: list[UploadFile] = File(...)) -> dict:
+    """
+    Enrol a person from one or more photographs.
+
+    Multiple files because one photograph is the failure mode, not the success
+    case. The shots are averaged into a single L2-normalised reference vector:
+    the centroid of that person's embedding cloud, which is more stable than any
+    individual sample. Adding shots to someone already enrolled blends the new
+    average into the stored vector rather than replacing it, so a profile that
+    has been matching in live traffic is not overwritten by one mediocre upload.
+
+    Every file gets a verdict. Anything unusable is named and explained rather
+    than quietly dropped, because a silent success that enrolled nothing is
+    precisely the failure mode of the missing endpoint this replaces.
+    """
+    key, display = _safe_identity(name)
+    if not files:
+        raise HTTPException(400, "no files uploaded")
+    if len(files) > 40:
+        raise HTTPException(400, "at most 40 photos per enrolment")
+
+    # Say "the model is not loaded" instead of letting every upload fail with
+    # "'NoneType' object has no attribute 'get'".
+    #
+    # The recogniser's app handle is None until the lifespan startup runs. Any
+    # request that arrives before that - a probe against a service still booting,
+    # or a tool calling the ASGI app directly - used to fail per-file with a
+    # message that pointed at insightface rather than at the actual cause. That
+    # cost a debugging cycle here, and it would cost an operator more: "no usable
+    # face in any of the uploads" on a fully-valid set of photos is the kind of
+    # report that sends someone off re-shooting portraits.
+    if getattr(recogniser, "app", None) is None:
+        raise HTTPException(503, "recognition model is still loading - retry shortly")
+
+    vecs: list[np.ndarray] = []
+    rejected: list[dict] = []
+    for f in files:
+        data = await f.read()
+        label = f.filename or "upload"
+        if not data:
+            rejected.append({"file": label, "why": "empty upload"})
+            continue
+        if len(data) > ENROL_MAX_BYTES:
+            rejected.append({"file": label, "why": "over 12 MB"})
+            continue
+        try:
+            import cv2
+            img = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if img is None:
+                rejected.append({"file": label, "why": "not a decodable image"})
+                continue
+            faces, matrix = recogniser.embed_bytes(img)
+            if not faces or matrix.size == 0:
+                rejected.append({"file": label, "why": "no face detected"})
+                continue
+            # Largest face wins: in a group shot the subject is the near one.
+            big = max(range(len(faces)),
+                      key=lambda i: faces[i]["bbox"][2] - faces[i]["bbox"][0])
+            width = float(faces[big]["bbox"][2] - faces[big]["bbox"][0])
+            if width < ENROL_MIN_FACE_PX:
+                rejected.append({
+                    "file": label, "face_px": round(width),
+                    "why": f"face only {width:.0f}px wide - need "
+                           f"{ENROL_MIN_FACE_PX}px for a trustworthy reference"})
+                continue
+            vecs.append(np.asarray(matrix[big], dtype=np.float32).reshape(-1))
+        except Exception as exc:                            # noqa: BLE001
+            rejected.append({"file": label, "why": f"{type(exc).__name__}: {exc}"})
+
+    if not vecs:
+        return {"ok": False, "name": display, "enrolled": 0,
+                "reason": "no usable face in any of the uploads",
+                "rejected": rejected, "identities": len(recogniser.names)}
+
+    stack = np.stack(vecs).astype(np.float32)
+    ref = stack.mean(axis=0)
+    nrm = float(np.linalg.norm(ref))
+    if nrm <= 0:
+        raise HTTPException(400, "embeddings cancelled out - try different photos")
+    ref = ref / nrm
+
+    # How far apart are these shots? A wide spread means the average is covering
+    # genuinely different views, which is the point. A near-zero spread means the
+    # "different" photos are near-duplicates and one reference would have done.
+    spread = float(np.mean(np.linalg.norm(stack - stack.mean(axis=0), axis=1)))
+
+    existed = key in recogniser.names
+    if existed:
+        prev = np.load(IDENTITY_DIR / f"{key}.npy").astype(np.float32).reshape(-1)
+        blended = prev + ref
+        pn = float(np.linalg.norm(blended))
+        if pn > 0:
+            ref = blended / pn
+
+    IDENTITY_DIR.mkdir(parents=True, exist_ok=True)
+    dest = IDENTITY_DIR / f"{key}.npy"
+    if dest.exists():
+        try:
+            dest.replace(dest.with_suffix(".npy.1"))
+        except OSError:
+            pass
+    np.save(dest, ref)
+    recogniser.reload_identities()
+    # Record the shot count BEFORE anything that can fail, and never let a
+    # provenance failure be silent. The vector is already on disk by this point,
+    # so a raise here would leave the gallery updated and the record stale - the
+    # exact state Joe_Lee was in. Reporting it lets the caller see the mismatch
+    # instead of inheriting it.
+    try:
+        _write_provenance(key, {"shots": len(vecs),
+                                "note": f"spread {spread:.3f}"})
+    except Exception as exc:                            # noqa: BLE001
+        raise HTTPException(
+            500, f"enrolled '{display}' but could not record its shot count: "
+                 f"{type(exc).__name__}: {exc}") from exc
+
+    # Does this already look like somebody in the gallery? Registering a second
+    # identity for one person is how a gallery fills with near-duplicate names
+    # that each match only their own single photograph.
+    dupes = []
+    if recogniser.matrix is not None:
+        sims = recogniser.matrix @ ref
+        for i, other in enumerate(recogniser.names):
+            if other != key and float(sims[i]) >= ENROL_DUPE_COS:
+                dupes.append({"name": other, "cosine": round(float(sims[i]), 4)})
+
+    scene.log("enrol", name=display,
+              detail=f"{len(vecs)} shot(s), spread {spread:.3f}")
+    return {"ok": True, "name": display, "key": key,
+            "updated_existing": existed, "enrolled": len(vecs),
+            "rejected": rejected, "spread": round(spread, 4),
+            "shot_quality": "thin" if len(vecs) < 5 else "ok",
+            "shot_note": ("fewer than 5 shots - this will be the weakest identity in "
+                          "the gallery and may be refused from a webcam"
+                          if len(vecs) < 5 else ""),
+            "similar_to": sorted(dupes, key=lambda d: -d["cosine"])[:3],
+            "identities": len(recogniser.names)}
+
+
+@application.delete("/api/identities/{key}")
+def enrol_delete(key: str) -> dict:
+    """Remove an identity from the gallery. The vector is kept as .npy.1."""
+    if key not in recogniser.names:
+        raise HTTPException(404, f"{key} is not enrolled")
+    p = IDENTITY_DIR / f"{key}.npy"
+    p.replace(p.with_suffix(".npy.1"))
+    recogniser.reload_identities()
+    scene.log("unenrol", name=key, detail="identity removed")
+    return {"ok": True, "removed": key, "identities": len(recogniser.names)}
+
+
 # ── Live HUD ingest ─────────────────────────────────────────────────────────
 # The browser owns the camera. It sends frames here for stage 1 and gets boxes
 # and track IDs back, which it draws over its own <video>.
@@ -871,9 +1265,18 @@ def live_stop(session: str = "default") -> dict:
 
 @application.get("/health")
 def health() -> dict:
+    # "status" becomes "degraded" - not "ok", not "down" - when the gallery was
+    # built by a different recognition network than the one now loaded. The
+    # service answers perfectly and every name it prints is wrong, which is the
+    # one failure a check for HTTP 200 cannot see. Anything watching this gets
+    # the reason instead of a green tick.
+    gallery = _gallery_pack_report()
     return {
-        "status": "ok",
+        "status": "ok" if gallery["ok"] else "degraded",
         "model_pack": faceapp.MODEL_PACK,
+        "recognition_net": gallery["recognition_net"],
+        "gallery": {k: v for k, v in gallery.items()
+                    if k not in ("model_pack", "recognition_net")},
         "identities_enrolled": len(recogniser.names),
         "present_now": len(scene.visitors),
         "threshold": MATCH_THRESHOLD,
@@ -2358,15 +2761,22 @@ function drawOverlay(d, isStill){
     const nr=normRect(p.norm||(fr.w&&fr.h
       ? [b[0]/fr.w, b[1]/fr.h, b[2]/fr.w, b[3]/fr.h]
       : [0,0,1,1]));
-    let X=nr.x, Y=nr.y, BW=nr.w, BH=nr.h;
-    const cx0=Math.max(0,X), cy0=Math.max(0,Y),
-          cx1=Math.min(W,X+BW), cy1=Math.min(H,Y+BH);
-    if(cx1<=cx0||cy1<=cy0){ return; }          // entirely outside: nothing to draw
-    X=cx0; Y=cy0; BW=cx1-cx0; BH=cy1-cy0;
-    // ── Stage 3 → 2 → 1, made visible on the box itself ──────────────────
-    // The HUD now runs all three stages on this frame, so the box carries the
-    // verdict: cyan while it is only a body, gold while the face is being
-    // checked, green once a name is attached.
+    // Fit the reticle to the FACE once we have one.
+    //
+    // YOLO's person class returns whole-body rectangles, so framing those is
+    // technically correct but useless as a targeting readout: the interesting
+    // part of a person is a tenth of the box and the rest is torso and legs. The
+    // face box comes from SCRFD at stage 2, so once it exists it becomes the
+    // primary reticle and the body box drops back to a faint context outline.
+    //
+    // DECLARATION ORDER MATTERS HERE, and getting it wrong cost two production
+    // incidents in a row. `idrec`, `stage` and `onFace` are all const, so any
+    // read above their declaration is a temporal-dead-zone ReferenceError thrown
+    // on every single live frame. The symptoms were "Frame dropped. Cannot
+    // access 'onFace' before initialization" and, before that, the same for
+    // 'idrec'. Declare first, use second - all of it, up here.
+
+    // Which stage this person is at, and what colour that reads as.
     const idrec=(id=(d.identify||{}).people||[]).find(q=>q&&q.box&&
                  q.box[0]===p.box[0]&&q.box[2]===p.box[2]) || null;
     const stage=idrec? idrec.stage : 'found';
@@ -2375,32 +2785,16 @@ function drawOverlay(d, isStill){
              : stage==='checked'? C.gold
              : tr? C.cyan : C.gold;
 
-    // A named person gets a solid inner face box, drawn INSIDE the face reticle
-    // rather than replacing it, so the name is visibly tied to the face.
-    if(onFace && stage==='named'){
-      hx.strokeStyle=C.grn; hx.lineWidth=Math.max(1,lw*1.2);
-      hx.strokeRect(X,Y,BW,BH);
-    }
-
-    // Fit the reticle to the FACE once we have one.
-    //
-    // YOLO's person class returns whole-body rectangles, so framing those is
-    // technically correct but useless as a targeting readout: the interesting
-    // part of a person is 10% of the box and the rest is torso and legs. The
-    // face box comes from SCRFD at stage 2, so once it exists it becomes the
-    // primary reticle and the body box drops back to a faint context outline.
+    let X=nr.x, Y=nr.y, BW=nr.w, BH=nr.h;
     let bodyX=X, bodyY=Y, bodyW=BW, bodyH=BH;
     const fdet = idrec && idrec.face;
     if(fdet && BW>26 && BH>26){
       const fn2=normRect((fr.w&&fr.h)
         ? [fdet.bbox[0]/fr.w, fdet.bbox[1]/fr.h, fdet.bbox[2]/fr.w, fdet.bbox[3]/fr.h]
         : [0,0,0,0]);
-      if(fn2.w>6 && fn2.h>6){
-        X=fn2.x; Y=fn2.y; BW=fn2.w; BH=fn2.h;
-      }
+      if(fn2.w>6 && fn2.h>6){ X=fn2.x; Y=fn2.y; BW=fn2.w; BH=fn2.h; }
     }
     const onFace = (X!==bodyX);
-
     // Context outline for the body, so you can still see what was detected.
     if(onFace){
       hx.strokeStyle='rgba(99,199,212,.34)'; hx.lineWidth=1;
@@ -2408,7 +2802,26 @@ function drawOverlay(d, isStill){
       hx.strokeRect(bodyX,bodyY,bodyW,bodyH);
       hx.setLineDash([]);
     }
+    const cx0=Math.max(0,X), cy0=Math.max(0,Y),
+          cx1=Math.min(W,X+BW), cy1=Math.min(H,Y+BH);
+    if(cx1<=cx0||cy1<=cy0){ return; }          // entirely outside: nothing to draw
+    X=cx0; Y=cy0; BW=cx1-cx0; BH=cy1-cy0;
+
+    // The HUD runs all three stages on this frame, so the box carries the
+    // verdict: cyan while it is only a body, gold while the face is being
+    // checked, green once a name is attached.
+
+    // Line weight depends on the final box size, so it has to be computed after
+    // the face-fit above - and read only after that. Same TDZ trap as onFace.
     const lw=Math.max(1.25, Math.min(BW,BH)/90);
+
+    // A named person gets a solid inner face box, drawn INSIDE the face reticle
+    // rather than replacing it, so the name is visibly tied to the face.
+    if(onFace && stage==='named'){
+      hx.strokeStyle=C.grn; hx.lineWidth=Math.max(1,lw*1.2);
+      hx.strokeRect(X,Y,BW,BH);
+    }
+
     hx.strokeStyle=col; hx.lineWidth=lw;
     hx.strokeRect(X,Y,BW,BH);
 
